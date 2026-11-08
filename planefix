@@ -6,6 +6,7 @@
 // - Bonnet / boot openings via stock OpenDoor (redirects nodes to bonnet_dummy / boot_dummy)
 // - Ground rolling wheels + stationary hubs that still steer (hub_lf/lb/rf/rb)
 // - Landing gear doors (landing_lf/rf/lr/rr_dummy)
+// - Hydra thruster offsets (thruster_f / thruster_r vs wheel_lm/rm_dummy)
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -32,8 +33,8 @@ using namespace plugin;
 // =====================================================================
 // Shared
 // =====================================================================
-constexpr unsigned PRERENDER_SLOT = 0x87198C; // CPlane vtable 0x871948 + 17*4
-constexpr unsigned OPENDOOR_SLOT = 0x8719B4; // CPlane vtable 0x871948 + 27*4
+constexpr unsigned PRERENDER_SLOT = 0x87198C;
+constexpr unsigned OPENDOOR_SLOT = 0x8719B4;
 constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
 constexpr unsigned SETUP_LIGHT_FLAGS = 0x4C8C90;
 constexpr unsigned LIGHTS_TWIN = 1;
@@ -481,8 +482,8 @@ static void OnVehicleDestroyed(CVehicle* veh) {
 // =====================================================================
 constexpr int DOOR_BONNET_ID = 0;
 constexpr int DOOR_BOOT_ID = 1;
-constexpr int NODE_BONNET = 16; // CAR_BONNET
-constexpr int NODE_BOOT = 17; // CAR_BOOT
+constexpr int NODE_BONNET = 16;
+constexpr int NODE_BOOT = 17;
 
 static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componentId, int door, float ratio, bool playSound) {
     if (door == DOOR_BONNET_ID || door == DOOR_BOOT_ID) {
@@ -509,12 +510,12 @@ static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componen
 // =====================================================================
 struct HubState {
     bool searched = false;
-    RwFrame* hub[4] = {}; // 0=lf, 1=lb, 2=rf, 3=rb
+    RwFrame* hub[4] = {};
     RwFrame* wheel[4] = {};
 };
 static std::unordered_map<CVehicle*, HubState> g_hubStates;
 
-static const int   kWheelNode[4] = { 5, 7, 2, 4 }; // LF, LB, RF, RB
+static const int   kWheelNode[4] = { 5, 7, 2, 4 };
 static const float kSpinSign[4] = { 1.0f, 1.0f, -1.0f, -1.0f };
 
 static void AddGroundRolling(CPlane* self) {
@@ -739,11 +740,75 @@ static void UpdateGearDoors(CPlane* veh) {
 }
 
 // =====================================================================
+// 8) Hydra thrusters (offsets only)
+// =====================================================================
+static bool GetNamedPos(RwFrame* root, const char* name, CVector& out) {
+    RwFrame* f = FindFrameByName(root, name);
+    if (!f)
+        return false;
+    RwMatrix* m = RwFrameGetMatrix(f);
+    if (!m)
+        return false;
+    out = { m->pos.x, m->pos.y, m->pos.z };
+    return true;
+}
+
+static RwV3d DeltaToOffset(const CVector& d) {
+    return { d.x, d.z, -d.y };
+}
+
+static void UpdateHydraThrusters(CVehicle* veh) {
+    if (!veh || veh->m_nModelIndex != MODEL_HYDRA || !veh->m_pRwClump)
+        return;
+
+    auto* plane = static_cast<CPlane*>(veh);
+    RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+    if (!root)
+        return;
+
+    CVector pivotF, pivotR, thrF, thrR;
+    if (!GetNamedPos(root, "wheel_lm_dummy", pivotF))
+        return;
+    if (!GetNamedPos(root, "wheel_rm_dummy", pivotR))
+        return;
+    if (!GetNamedPos(root, "thruster_f", thrF))
+        return;
+    if (!GetNamedPos(root, "thruster_r", thrR))
+        return;
+
+    const CVector dF = {
+        thrF.x - pivotF.x,
+        thrF.y - pivotF.y,
+        thrF.z - pivotF.z
+    };
+    const CVector dR = {
+        thrR.x - pivotR.x,
+        thrR.y - pivotR.y,
+        thrR.z - pivotR.z
+    };
+
+    const RwV3d offs[4] = {
+        DeltaToOffset(dF),                       // 0 RF
+        DeltaToOffset({ -dF.x, dF.y, dF.z }),    // 1 LF
+        DeltaToOffset(dR),                       // 2 RR
+        DeltaToOffset({ -dR.x, dR.y, dR.z }),    // 3 LR
+    };
+
+    for (int i = 0; i < 4; i++) {
+        FxSystem_c* fx = plane->m_apJettrusParticles[i];
+        if (!fx)
+            continue;
+        RwV3d off = offs[i];
+        fx->SetOffsetPos(&off);
+    }
+}
+
+// =====================================================================
 // Combined PreRender
 // =====================================================================
 static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
     if (self)
-        UpdateGearDoors(self); // before stock so gear value is applied first
+        UpdateGearDoors(self);
 
     if (self && self->m_pRwObject && self->m_matrix)
         AddGroundRolling(self);
@@ -822,6 +887,10 @@ public:
             if (incoming == kStockEntityRef)
                 RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTIONREF,
                     reinterpret_cast<void*>(kCarRef));
+            };
+
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            UpdateHydraThrusters(veh);
             };
 
         Events::vehicleDtorEvent += [](CVehicle* veh) {
