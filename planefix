@@ -3,6 +3,7 @@
 // - Extra ailerons (aileron_l2 / aileron_r2 hinged on aileron2_pos)
 // - Alpha-test ref fix for planes / helis / trains / boats
 // - Custom exhaust (startup puff + heat haze, optional double)
+// - Bonnet / boot openings via stock OpenDoor (redirects nodes to bonnet_dummy / boot_dummy)
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -28,14 +29,18 @@ using namespace plugin;
 // Shared
 // =====================================================================
 constexpr unsigned PRERENDER_SLOT = 0x87198C; // CPlane vtable 0x871948 + 17*4
+constexpr unsigned OPENDOOR_SLOT = 0x8719B4; // CPlane vtable 0x871948 + 27*4
 constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
 constexpr unsigned SETUP_LIGHT_FLAGS = 0x4C8C90;
 constexpr unsigned LIGHTS_TWIN = 1;
 
 using PlaneFn = void(__thiscall*)(CPlane*);
 using LightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
-using SetupLightFlagsFn = void(__cdecl*)(CVehicle*);   // same as your working lights code
+using SetupLightFlagsFn = void(__cdecl*)(CVehicle*);
+using OpenDoorFn = void(__thiscall*)(CPlane*, CPed*, int, int, float, bool);
+
 static PlaneFn origPreRender;
+static OpenDoorFn origOpenDoor;
 
 static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
     if (!root || !name)
@@ -147,7 +152,6 @@ static void UpdateLampTextures(CPlane* self) {
     if (c.mats.empty() || !CVehicleModelInfo::ms_pLightsTexture || !CVehicleModelInfo::ms_lightsOn)
         return;
 
-    // Exact form from your working lights code
     reinterpret_cast<SetupLightFlagsFn>(SETUP_LIGHT_FLAGS)(self);
 
     for (const LampMat& l : c.mats) {
@@ -339,16 +343,11 @@ static RwMatrix* NextPuffMatrix() {
 }
 
 static RwMatrix* RootMatrix(CPlane* veh) {
-    if (!veh || !veh->m_pRwClump)
-        return nullptr;
-    RwFrame* f = RpClumpGetFrame(veh->m_pRwClump);
-    return f ? RwFrameGetMatrix(f) : nullptr;
+    return RwFrameGetMatrix(RpClumpGetFrame(veh->m_pRwClump));
 }
 
 static void UpdatePuffMatrix(CPlane* veh, RwMatrix* out, const RwV3d& dummy) {
     RwMatrix* root = RootMatrix(veh);
-    if (!root || !out)
-        return;
     RwV3d world;
     RwV3dTransformPoints(&world, &dummy, 1, root);
     *out = *root;
@@ -364,11 +363,8 @@ static void UpdatePuffMatrix(CPlane* veh, RwMatrix* out, const RwV3d& dummy) {
 }
 
 static FxSystem_c* CreateHaze(CPlane* veh, const RwV3d& dummy) {
-    RwMatrix* root = RootMatrix(veh);
-    if (!root)
-        return nullptr;
     RwV3d pos = dummy;
-    FxSystem_c* fx = g_fxMan.CreateFxSystem(const_cast<char*>("nitro"), &pos, root, true);
+    FxSystem_c* fx = g_fxMan.CreateFxSystem(const_cast<char*>("nitro"), &pos, RootMatrix(veh), true);
     if (!fx)
         return nullptr;
     fx->SetLocalParticles(true);
@@ -393,12 +389,11 @@ static void StartPuff(CPlane* veh, ExhaustState& s, int i, const RwV3d& dummy) {
 }
 
 static void UpdateExhaust(CPlane* veh) {
-    if (!veh || !veh->m_pRwClump)
+    if (!veh->m_pRwClump)
         return;
     auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(veh->m_nModelIndex));
     if (!mi || !mi->m_pVehicleStruct)
         return;
-
     const CVector& d = mi->m_pVehicleStruct->m_avDummyPos[kExhaustDummyIndex];
     if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f)
         return;
@@ -454,13 +449,40 @@ static void OnVehicleDestroyed(CVehicle* veh) {
 }
 
 // =====================================================================
-// Combined PreRender (lights + exhaust)
+// 5) Bonnet / boot
+// =====================================================================
+constexpr int DOOR_BONNET_ID = 0;
+constexpr int DOOR_BOOT_ID = 1;
+constexpr int NODE_BONNET = 16; // CAR_BONNET
+constexpr int NODE_BOOT = 17; // CAR_BOOT
+
+static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componentId, int door, float ratio, bool playSound) {
+    if (door == DOOR_BONNET_ID || door == DOOR_BOOT_ID) {
+        const bool bonnet = (door == DOOR_BONNET_ID);
+        const int node = bonnet ? NODE_BONNET : NODE_BOOT;
+
+        RwFrame* frame = nullptr;
+        if (self->m_pRwClump)
+            frame = FindFrameByName(RpClumpGetFrame(self->m_pRwClump), bonnet ? "bonnet_dummy" : "boot_dummy");
+        if (!frame)
+            return; // no such part; do not rotate rudder / elevator
+
+        RwFrame* saved = self->m_aCarNodes[node];
+        self->m_aCarNodes[node] = frame;
+        origOpenDoor(self, ped, node, door, ratio, playSound);
+        self->m_aCarNodes[node] = saved;
+        return;
+    }
+    origOpenDoor(self, ped, componentId, door, ratio, playSound);
+}
+
+// =====================================================================
+// Combined PreRender (exhaust first, then lights)
 // =====================================================================
 static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
     if (origPreRender)
         origPreRender(self);
 
-    // Exhaust first — same timing as your original hook
     UpdateExhaust(self);
 
     if (self && self->m_pRwObject && self->m_matrix && HasMainLightDummies(self)) {
@@ -478,6 +500,9 @@ public:
     PlaneFeatures() {
         origPreRender = reinterpret_cast<PlaneFn>(*reinterpret_cast<unsigned*>(PRERENDER_SLOT));
         patch::SetPointer(PRERENDER_SLOT, reinterpret_cast<void*>(&CombinedPreRenderHook));
+
+        origOpenDoor = reinterpret_cast<OpenDoorFn>(*reinterpret_cast<unsigned*>(OPENDOOR_SLOT));
+        patch::SetPointer(OPENDOOR_SLOT, reinterpret_cast<void*>(&OpenDoorHook));
 
         Events::vehicleRenderEvent += [](CVehicle* veh) {
             if (!veh || !veh->m_pRwClump)
