@@ -4,6 +4,7 @@
 // - Alpha-test ref fix for planes / helis / trains / boats
 // - Custom exhaust (startup puff + heat haze, optional double)
 // - Bonnet / boot openings via stock OpenDoor (redirects nodes to bonnet_dummy / boot_dummy)
+// - Ground rolling wheels + stationary hubs that still steer (hub_lf/lb/rf/rb)
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include "CModelInfo.h"
 #include "CVehicleModelInfo.h"
 #include "CGame.h"
+#include "CTimer.h"
 #include "FxManager_c.h"
 #include "FxSystem_c.h"
 #include "RenderWare.h"
@@ -33,6 +35,7 @@ constexpr unsigned OPENDOOR_SLOT = 0x8719B4; // CPlane vtable 0x871948 + 27*4
 constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
 constexpr unsigned SETUP_LIGHT_FLAGS = 0x4C8C90;
 constexpr unsigned LIGHTS_TWIN = 1;
+constexpr float   RAD2DEG = 180.0f / 3.14159265f;
 
 using PlaneFn = void(__thiscall*)(CPlane*);
 using LightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
@@ -465,7 +468,7 @@ static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componen
         if (self->m_pRwClump)
             frame = FindFrameByName(RpClumpGetFrame(self->m_pRwClump), bonnet ? "bonnet_dummy" : "boot_dummy");
         if (!frame)
-            return; // no such part; do not rotate rudder / elevator
+            return;
 
         RwFrame* saved = self->m_aCarNodes[node];
         self->m_aCarNodes[node] = frame;
@@ -477,11 +480,93 @@ static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componen
 }
 
 // =====================================================================
-// Combined PreRender (exhaust first, then lights)
+// 6) Rolling wheels + hubs
+// =====================================================================
+struct HubState {
+    bool searched = false;
+    RwFrame* hub[4] = {}; // 0=lf, 1=lb, 2=rf, 3=rb
+    RwFrame* wheel[4] = {};
+};
+static std::unordered_map<CVehicle*, HubState> g_hubStates;
+
+// Stock CPlane::PreRender UpdateWheelMatrix nodes: LF=5, LB=7, RF=2, RB=4
+static const int   kWheelNode[4] = { 5, 7, 2, 4 };
+// Left side +1, right side -1 (settled)
+static const float kSpinSign[4] = { 1.0f, 1.0f, -1.0f, -1.0f };
+
+static void AddGroundRolling(CPlane* self) {
+    auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
+    if (!mi || !self->m_matrix)
+        return;
+
+    const CVector forward = self->m_matrix->up;
+
+    for (int i = 0; i < 4; i++) {
+        if (self->m_fWheelCounts[i] <= 0.0f)
+            continue;
+        const float size = (i == 0 || i == 2) ? mi->m_fWheelSizeFront : mi->m_fWheelSizeRear;
+        const float radius = size * 0.5f;
+        if (radius <= 0.0f)
+            continue;
+        self->m_fWheelRotation[i] += CTimer::ms_fTimeStep *
+            self->ProcessWheelRotation((tWheelState)self->m_wheelState[i], forward, self->m_vecMoveSpeed, radius);
+    }
+}
+
+static void UpdateHubs(CPlane* self) {
+    if (!self->m_pRwClump)
+        return;
+
+    HubState& st = g_hubStates[self];
+    if (!st.searched) {
+        st.searched = true;
+        RwFrame* root = RpClumpGetFrame(self->m_pRwClump);
+        if (root) {
+            st.hub[0] = FindFrameByName(root, "hub_lf");
+            st.hub[1] = FindFrameByName(root, "hub_lb");
+            st.hub[2] = FindFrameByName(root, "hub_rf");
+            st.hub[3] = FindFrameByName(root, "hub_rb");
+        }
+        for (int i = 0; i < 4; i++)
+            st.wheel[i] = self->m_aCarNodes[kWheelNode[i]];
+    }
+
+    for (int i = 0; i < 4; i++) {
+        RwFrame* hub = st.hub[i];
+        RwFrame* wheel = st.wheel[i];
+        if (!hub || !wheel)
+            continue;
+
+        RwMatrix* hm = RwFrameGetMatrix(hub);
+        RwMatrix* wm = RwFrameGetMatrix(wheel);
+        if (!hm || !wm)
+            continue;
+
+        hm->right = wm->right;
+        hm->up = wm->up;
+        hm->at = wm->at;
+        hm->pos = wm->pos;
+
+        const float deg = kSpinSign[i] * self->m_fWheelRotation[i] * RAD2DEG;
+        const RwV3d xAxis = { 1.0f, 0.0f, 0.0f };
+        RwMatrixRotate(hm, &xAxis, deg, rwCOMBINEPRECONCAT);
+        RwMatrixUpdate(hm);
+        RwFrameUpdateObjects(hub);
+    }
+}
+
+// =====================================================================
+// Combined PreRender
 // =====================================================================
 static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
+    if (self && self->m_pRwObject && self->m_matrix)
+        AddGroundRolling(self);
+
     if (origPreRender)
         origPreRender(self);
+
+    if (self && self->m_pRwObject)
+        UpdateHubs(self);
 
     UpdateExhaust(self);
 
@@ -564,6 +649,7 @@ public:
                 }
             }
             g_aileronStates.erase(veh);
+            g_hubStates.erase(veh);
             OnVehicleDestroyed(veh);
             };
     }
