@@ -5,6 +5,8 @@
 // - Custom exhaust (startup puff + heat haze, optional double)
 // - Bonnet / boot openings via stock OpenDoor (redirects nodes to bonnet_dummy / boot_dummy)
 // - Ground rolling wheels + stationary hubs that still steer (hub_lf/lb/rf/rb)
+// - Landing gear doors (landing_lf/rf/lr/rr_dummy)
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -186,9 +188,8 @@ static void DoPlaneLightsSafe(CPlane* self) {
     const bool z0 = IsZeroDummy(d0);
     const bool z1 = IsZeroDummy(d1);
     if (z0 && z1)
-        return; // no main light dummies at all
+        return;
 
-    // Park any missing dummy so DoVehicleLights cannot put a corona at the origin
     const CVector parked = { 0.0f, 0.0f, -1000.0f };
     CVector saved0, saved1;
     if (z0) { saved0 = d0; d0 = parked; }
@@ -513,9 +514,7 @@ struct HubState {
 };
 static std::unordered_map<CVehicle*, HubState> g_hubStates;
 
-// Stock CPlane::PreRender UpdateWheelMatrix nodes: LF=5, LB=7, RF=2, RB=4
-static const int   kWheelNode[4] = { 5, 7, 2, 4 };
-// Left side +1, right side -1 (settled)
+static const int   kWheelNode[4] = { 5, 7, 2, 4 }; // LF, LB, RF, RB
 static const float kSpinSign[4] = { 1.0f, 1.0f, -1.0f, -1.0f };
 
 static void AddGroundRolling(CPlane* self) {
@@ -580,9 +579,172 @@ static void UpdateHubs(CPlane* self) {
 }
 
 // =====================================================================
+// 7) Landing gear doors
+// =====================================================================
+constexpr float kOpenAngleDeg = 80.0f;
+constexpr float kDoorSec = 0.7f;
+constexpr float kCloseDelaySec = 0.0f;
+constexpr float kGearHoldSec = 0.3f;
+constexpr float kGearUpThreshold = 0.4f;
+
+struct DoorCfg {
+    const char* name;
+    float       axisX, axisY, axisZ;
+    float       sign;
+};
+static const DoorCfg kGearDoors[4] = {
+    { "landing_lf_dummy", 0.0f, 1.0f, 0.0f,  1.0f },
+    { "landing_rf_dummy", 0.0f, 1.0f, 0.0f, -1.0f },
+    { "landing_lr_dummy", 0.0f, 1.0f, 0.0f,  1.0f },
+    { "landing_rr_dummy", 0.0f, 1.0f, 0.0f, -1.0f },
+};
+
+template <class T> auto GearRefImpl(T* p, Pri2) -> decltype((p->m_LandingGearAngle)) { return p->m_LandingGearAngle; }
+template <class T> auto GearRefImpl(T* p, Pri1) -> decltype((p->m_fLandingGearStatus)) { return p->m_fLandingGearStatus; }
+template <class T> float& GearRefImpl(T*, Pri0) {
+    static_assert(sizeof(T) == 0, "LandingGearDoors: could not find the landing gear member (m_LandingGearAngle / m_fLandingGearStatus) in CPlane");
+    static float unused;
+    return unused;
+}
+static float& GearRef(CPlane* p) { return GearRefImpl(p, Pri2{}); }
+
+struct GearDoor {
+    RwFrame* frame = nullptr;
+    RwMatrix rest;
+};
+struct PlaneGearDoors {
+    RpClump* clump = nullptr;
+    bool     any = false;
+    GearDoor doors[4];
+
+    bool  seen = false;
+    bool  wasUp = false;
+    float open = 0.0f;
+    float closeDelayLeft = 0.0f;
+    float holdLeft = 0.0f;
+    float heldValue = 0.0f;
+    float lastApplied = -1.0f;
+};
+static std::unordered_map<CVehicle*, PlaneGearDoors> g_gearDoors;
+
+struct FindCtx {
+    const char* name;
+    RwFrame* found;
+};
+
+static RwFrame* FindFrameCB(RwFrame* frame, void* data) {
+    auto* ctx = static_cast<FindCtx*>(data);
+    const char* n = GetFrameNodeName(frame);
+    if (n && _stricmp(n, ctx->name) == 0) {
+        ctx->found = frame;
+        return nullptr;
+    }
+    RwFrameForAllChildren(frame, FindFrameCB, ctx);
+    return ctx->found ? nullptr : frame;
+}
+
+static void UpdateGearDoors(CPlane* veh) {
+    RpClump* clump = veh->m_pRwClump;
+    if (!clump)
+        return;
+
+    PlaneGearDoors& pd = g_gearDoors[veh];
+    if (pd.clump != clump) {
+        pd.clump = clump;
+        pd.any = false;
+        pd.lastApplied = -1.0f;
+        for (int i = 0; i < 4; i++) {
+            FindCtx ctx = { kGearDoors[i].name, nullptr };
+            RwFrameForAllChildren(RpClumpGetFrame(clump), FindFrameCB, &ctx);
+            pd.doors[i].frame = ctx.found;
+            if (ctx.found) {
+                pd.doors[i].rest = *RwFrameGetMatrix(ctx.found);
+                pd.any = true;
+            }
+        }
+    }
+    if (!pd.any)
+        return;
+
+    const float dt = CTimer::ms_fTimeStep / 50.0f;
+    float& gear = GearRef(veh);
+
+    if (!pd.seen) {
+        pd.seen = true;
+        pd.wasUp = gear >= kGearUpThreshold;
+        pd.open = pd.wasUp ? 0.0f : 1.0f;
+        pd.closeDelayLeft = 0.0f;
+    }
+
+    if (pd.holdLeft > 0.0f) {
+        pd.holdLeft -= dt;
+        if (pd.holdLeft <= 0.0f) {
+            pd.holdLeft = 0.0f;
+            gear = pd.heldValue;
+        }
+        else {
+            gear = 1.0f;
+        }
+    }
+    else if (pd.wasUp&& gear < kGearUpThreshold) {
+        pd.heldValue = gear;
+        pd.holdLeft = kGearHoldSec;
+        gear = 1.0f;
+    }
+
+    const bool holding = pd.holdLeft > 0.0f;
+    const bool gearMostlyUp = gear >= kGearUpThreshold;
+    pd.wasUp = gearMostlyUp;
+
+    float target = 1.0f;
+    if (holding) {
+        pd.closeDelayLeft = kCloseDelaySec;
+        target = 1.0f;
+    }
+    else if (gearMostlyUp) {
+        if (kCloseDelaySec <= 0.0f) {
+            target = 0.0f;
+        }
+        else {
+            pd.closeDelayLeft -= dt;
+            if (pd.closeDelayLeft <= 0.0f)
+                target = 0.0f;
+        }
+    }
+    else {
+        pd.closeDelayLeft = kCloseDelaySec;
+        target = 1.0f;
+    }
+
+    const float doorSec = (kDoorSec > 0.001f) ? kDoorSec : 0.001f;
+    const float step = dt / doorSec;
+    pd.open = pd.open < target ? std::min(target, pd.open + step) : std::max(target, pd.open - step);
+    const float eased = pd.open * pd.open * (3.0f - 2.0f * pd.open);
+
+    if (std::fabs(eased - pd.lastApplied) < 0.0001f)
+        return;
+    pd.lastApplied = eased;
+
+    for (int i = 0; i < 4; i++) {
+        RwFrame* frame = pd.doors[i].frame;
+        if (!frame)
+            continue;
+        RwMatrix* m = RwFrameGetMatrix(frame);
+        *m = pd.doors[i].rest;
+        const RwV3d axis = { kGearDoors[i].axisX, kGearDoors[i].axisY, kGearDoors[i].axisZ };
+        RwMatrixRotate(m, &axis, kOpenAngleDeg * kGearDoors[i].sign * eased, rwCOMBINEPRECONCAT);
+        RwMatrixUpdate(m);
+        RwFrameUpdateObjects(frame);
+    }
+}
+
+// =====================================================================
 // Combined PreRender
 // =====================================================================
 static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
+    if (self)
+        UpdateGearDoors(self); // before stock so gear value is applied first
+
     if (self && self->m_pRwObject && self->m_matrix)
         AddGroundRolling(self);
 
@@ -674,6 +836,7 @@ public:
             }
             g_aileronStates.erase(veh);
             g_hubStates.erase(veh);
+            g_gearDoors.erase(veh);
             OnVehicleDestroyed(veh);
             };
     }
