@@ -1,0 +1,545 @@
+// Combined plane features (plugin-sdk, GTA SA 1.0 US)
+// - Stock vehicle lights + lamp texture swap (CPlane::PreRender)
+// - Extra ailerons (aileron_l2 / aileron_r2 hinged on aileron2_pos)
+// - Alpha-test ref fix for planes / helis / trains / boats
+// - Custom exhaust (startup puff + heat haze, optional double)
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <unordered_map>
+#include <vector>
+#include <windows.h>
+
+#include "plugin.h"
+#include "CPlane.h"
+#include "CVehicle.h"
+#include "CModelInfo.h"
+#include "CVehicleModelInfo.h"
+#include "CGame.h"
+#include "FxManager_c.h"
+#include "FxSystem_c.h"
+#include "RenderWare.h"
+#include "NodeName.h"
+#include "common.h"
+
+using namespace plugin;
+
+// =====================================================================
+// Shared
+// =====================================================================
+constexpr unsigned PRERENDER_SLOT = 0x87198C; // CPlane vtable 0x871948 + 17*4
+constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
+constexpr unsigned SETUP_LIGHT_FLAGS = 0x4C8C90;
+constexpr unsigned LIGHTS_TWIN = 1;
+
+using PlaneFn = void(__thiscall*)(CPlane*);
+using LightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
+using SetupLightFlagsFn = void(__cdecl*)(CVehicle*);   // same as your working lights code
+static PlaneFn origPreRender;
+
+static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
+    if (!root || !name)
+        return nullptr;
+    if (const char* n = GetFrameNodeName(root)) {
+        if (std::strcmp(n, name) == 0)
+            return root;
+    }
+    for (RwFrame* c = root->child; c; c = c->next) {
+        if (RwFrame* f = FindFrameByName(c, name))
+            return f;
+    }
+    return nullptr;
+}
+
+// =====================================================================
+// 1) Plane lights
+// =====================================================================
+struct Marker { uint8_t r, g, b; };
+static const Marker kMarkers[4] = { {255,175,0}, {0,255,200}, {185,255,0}, {255,60,0} };
+
+static const char* kIgnoreFramePrefixes[] = { nullptr /* , "foglight" */ };
+
+struct LampMat {
+    RpMaterial* mat;
+    RwTexture* original;
+    int         lamp;
+};
+struct ModelCache {
+    RpClump* templ = nullptr;
+    std::vector<LampMat> mats;
+};
+static std::unordered_map<int, ModelCache> g_cache;
+static std::unordered_map<CVehicle*, int>  g_seen;
+static std::unordered_map<int, int>        g_liveCount;
+
+static void ReleaseModel(int model) {
+    auto it = g_cache.find(model);
+    if (it == g_cache.end())
+        return;
+    for (const LampMat& l : it->second.mats) {
+        if (l.mat && RpMaterialGetTexture(l.mat) != l.original)
+            RpMaterialSetTexture(l.mat, l.original);
+    }
+    g_cache.erase(it);
+}
+
+static int MarkerIndex(const RwRGBA* c) {
+    if (!c)
+        return -1;
+    for (int i = 0; i < 4; i++) {
+        if (c->red == kMarkers[i].r && c->green == kMarkers[i].g && c->blue == kMarkers[i].b)
+            return i;
+    }
+    return -1;
+}
+
+static RpMaterial* CollectMaterial(RpMaterial* m, void* data) {
+    if (!m)
+        return m;
+    RwTexture* tex = RpMaterialGetTexture(m);
+    if (!tex)
+        return m;
+    const char* tname = RwTextureGetName(tex);
+    if (!tname || _strnicmp(tname, "vehiclelights", 13) != 0)
+        return m;
+    const int lamp = MarkerIndex(RpMaterialGetColor(m));
+    if (lamp < 0)
+        return m;
+    static_cast<std::vector<LampMat>*>(data)->push_back({ m, tex, lamp });
+    return m;
+}
+
+static RpAtomic* CollectAtomic(RpAtomic* a, void* data) {
+    if (!a)
+        return a;
+    RwFrame* frame = RpAtomicGetFrame(a);
+    if (frame) {
+        if (const char* name = GetFrameNodeName(frame)) {
+            for (const char* prefix : kIgnoreFramePrefixes) {
+                if (prefix && _strnicmp(name, prefix, std::strlen(prefix)) == 0)
+                    return a;
+            }
+        }
+    }
+    if (RpGeometry* g = RpAtomicGetGeometry(a))
+        RpGeometryForAllMaterials(g, CollectMaterial, data);
+    return a;
+}
+
+static void UpdateLampTextures(CPlane* self) {
+    if (!self)
+        return;
+    CBaseModelInfo* mi = CModelInfo::GetModelInfo(self->m_nModelIndex);
+    if (!mi || !mi->m_pRwObject)
+        return;
+
+    if (g_seen.emplace(self, static_cast<int>(self->m_nModelIndex)).second)
+        ++g_liveCount[self->m_nModelIndex];
+
+    ModelCache& c = g_cache[self->m_nModelIndex];
+    RpClump* templ = reinterpret_cast<RpClump*>(mi->m_pRwObject);
+    if (c.templ != templ) {
+        c.templ = templ;
+        c.mats.clear();
+        if (templ)
+            RpClumpForAllAtomics(templ, CollectAtomic, &c.mats);
+    }
+    if (c.mats.empty() || !CVehicleModelInfo::ms_pLightsTexture || !CVehicleModelInfo::ms_lightsOn)
+        return;
+
+    // Exact form from your working lights code
+    reinterpret_cast<SetupLightFlagsFn>(SETUP_LIGHT_FLAGS)(self);
+
+    for (const LampMat& l : c.mats) {
+        if (!l.mat || !l.original || l.lamp < 0 || l.lamp > 3)
+            continue;
+        const bool on = CVehicleModelInfo::ms_lightsOn[l.lamp] != 0;
+        RwTexture* want = on ? CVehicleModelInfo::ms_pLightsTexture : l.original;
+        if (RpMaterialGetTexture(l.mat) != want)
+            RpMaterialSetTexture(l.mat, want);
+    }
+}
+
+static bool HasMainLightDummies(CPlane* self) {
+    if (!self)
+        return false;
+    auto* vmi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
+    if (!vmi || !vmi->m_pVehicleStruct)
+        return false;
+    auto isZero = [](const CVector& v) { return v.x == 0.0f && v.y == 0.0f && v.z == 0.0f; };
+    return !(isZero(vmi->m_pVehicleStruct->m_avDummyPos[0]) && isZero(vmi->m_pVehicleStruct->m_avDummyPos[1]));
+}
+
+// =====================================================================
+// 2) Extra ailerons
+// =====================================================================
+struct RestMat {
+    bool valid = false;
+    RwV3d right{}, up{}, at{}, pos{};
+};
+struct ExtraAileronState {
+    bool searched = false;
+    RwFrame* l2 = nullptr;
+    RwFrame* r2 = nullptr;
+    RwFrame* p2 = nullptr;
+    RestMat restL, restR, restL2, restR2, restP2;
+};
+static std::unordered_map<CVehicle*, ExtraAileronState> g_aileronStates;
+
+static void SaveRest(RwFrame* f, RestMat& out) {
+    if (!f || out.valid)
+        return;
+    RwMatrix* m = RwFrameGetMatrix(f);
+    if (!m)
+        return;
+    out.right = m->right;
+    out.up = m->up;
+    out.at = m->at;
+    out.pos = m->pos;
+    out.valid = true;
+}
+
+static RwV3d RotateAroundAxis(const RwV3d& v, const RwV3d& a, float c, float s) {
+    const float dot = a.x * v.x + a.y * v.y + a.z * v.z;
+    const RwV3d cr = {
+        a.y * v.z - a.z * v.y,
+        a.z * v.x - a.x * v.z,
+        a.x * v.y - a.y * v.x
+    };
+    const float k = dot * (1.0f - c);
+    return {
+        v.x * c + cr.x * s + a.x * k,
+        v.y * c + cr.y * s + a.y * k,
+        v.z * c + cr.z * s + a.z * k
+    };
+}
+
+static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
+    RwFrame* dst, const RestMat& dstRest, const RwV3d& hingeEnd) {
+    if (!src || !dst || !srcRest.valid || !dstRest.valid)
+        return;
+    RwMatrix* sm = RwFrameGetMatrix(src);
+    RwMatrix* dm = RwFrameGetMatrix(dst);
+    if (!sm || !dm)
+        return;
+
+    const RwV3d u = sm->up;
+    const float dUpY = srcRest.up.x * u.x + srcRest.up.y * u.y + srcRest.up.z * u.z;
+    const float dUpZ = srcRest.at.x * u.x + srcRest.at.y * u.y + srcRest.at.z * u.z;
+    const float angle = atan2f(dUpZ, dUpY);
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+
+    RwV3d axis = {
+        hingeEnd.x - dstRest.pos.x,
+        hingeEnd.y - dstRest.pos.y,
+        hingeEnd.z - dstRest.pos.z
+    };
+    float len = sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+    if (len < 1e-5f) {
+        axis = dstRest.right;
+        len = sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+        if (len < 1e-5f)
+            return;
+    }
+    axis.x /= len; axis.y /= len; axis.z /= len;
+
+    if (axis.x * srcRest.right.x + axis.y * srcRest.right.y + axis.z * srcRest.right.z < 0.0f) {
+        axis.x = -axis.x; axis.y = -axis.y; axis.z = -axis.z;
+    }
+
+    dm->right = RotateAroundAxis(dstRest.right, axis, c, s);
+    dm->up = RotateAroundAxis(dstRest.up, axis, c, s);
+    dm->at = RotateAroundAxis(dstRest.at, axis, c, s);
+    dm->pos = dstRest.pos;
+    RwMatrixUpdate(dm);
+    RwFrameUpdateObjects(dst);
+}
+
+// =====================================================================
+// 3) Alpha-test ref fix
+// =====================================================================
+static constexpr uintptr_t kStockEntityRef = 100;
+static constexpr uintptr_t kCarRef = 1;
+
+static bool ShouldFixAlphaRef(CVehicle* veh) {
+    if (!veh)
+        return false;
+    auto* mi = static_cast<CVehicleModelInfo*>(
+        CModelInfo::GetModelInfo(veh->m_nModelIndex));
+    if (!mi)
+        return false;
+    switch (mi->m_nVehicleType) {
+    case VEHICLE_PLANE:
+    case VEHICLE_HELI:
+    case VEHICLE_TRAIN:
+    case VEHICLE_BOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// =====================================================================
+// 4) Custom exhaust
+// =====================================================================
+constexpr int      kExhaustDummyIndex = 6;
+constexpr float    kHazeIntensity = 0.1f;
+constexpr float    kPuffIntensity = 0.9f;
+constexpr float    kPuffScale = 0.6f;
+constexpr unsigned kPuffMs = 500;
+constexpr float    kPuffPitchDeg = 90.0f;
+
+struct Pri0 {};
+struct Pri1 : Pri0 {};
+struct Pri2 : Pri1 {};
+
+template <class T> auto EngineOnImpl(const T* v, Pri2) -> decltype(bool(v->bEngineOn)) { return v->bEngineOn; }
+template <class T> auto EngineOnImpl(const T* v, Pri1) -> decltype(bool(v->vehicleFlags.bEngineOn)) { return v->vehicleFlags.bEngineOn; }
+template <class T> bool EngineOnImpl(const T* v, Pri0) { return (*(reinterpret_cast<const uint8_t*>(v) + 0x428) & 0x10) != 0; }
+static bool EngineOn(const CVehicle* v) { return EngineOnImpl(v, Pri2{}); }
+
+template <class T> auto DoubleExhaustImpl(const T* v, Pri2) -> decltype(bool(v->m_pHandlingData->m_bDoubleExhaust)) {
+    return v->m_pHandlingData->m_bDoubleExhaust;
+}
+template <class T> auto DoubleExhaustImpl(const T* v, Pri1) -> decltype(bool(v->m_pHandlingData->m_nModelFlags & 0x2000)) {
+    return (v->m_pHandlingData->m_nModelFlags & 0x2000) != 0;
+}
+template <class T> bool DoubleExhaustImpl(const T*, Pri0) {
+    static_assert(sizeof(T) == 0, "PlaneExhaust: could not find the handling model flags (m_bDoubleExhaust / m_nModelFlags) in your headers");
+    return false;
+}
+static bool DoubleExhaust(const CVehicle* v) { return v->m_pHandlingData && DoubleExhaustImpl(v, Pri2{}); }
+
+struct ExhaustState {
+    bool        seen = false;
+    bool        engineWasOn = false;
+    FxSystem_c* haze[2] = {};
+    FxSystem_c* puff[2] = {};
+    RwMatrix* puffMat[2] = {};
+    DWORD       puffEnd = 0;
+};
+static std::unordered_map<CVehicle*, ExhaustState> g_exhaustStates;
+
+static void Kill(FxSystem_c*& fx) {
+    if (fx) {
+        fx->Kill();
+        fx = nullptr;
+    }
+}
+
+static RwMatrix* NextPuffMatrix() {
+    static RwMatrix* pool[16] = {};
+    static int next = 0;
+    RwMatrix*& m = pool[next];
+    next = (next + 1) % 16;
+    if (!m)
+        m = RwMatrixCreate();
+    return m;
+}
+
+static RwMatrix* RootMatrix(CPlane* veh) {
+    if (!veh || !veh->m_pRwClump)
+        return nullptr;
+    RwFrame* f = RpClumpGetFrame(veh->m_pRwClump);
+    return f ? RwFrameGetMatrix(f) : nullptr;
+}
+
+static void UpdatePuffMatrix(CPlane* veh, RwMatrix* out, const RwV3d& dummy) {
+    RwMatrix* root = RootMatrix(veh);
+    if (!root || !out)
+        return;
+    RwV3d world;
+    RwV3dTransformPoints(&world, &dummy, 1, root);
+    *out = *root;
+    const RwV3d xAxis = { 1.0f, 0.0f, 0.0f };
+    RwMatrixRotate(out, &xAxis, kPuffPitchDeg, rwCOMBINEPRECONCAT);
+    for (RwV3d* axis : { &out->right, &out->up, &out->at }) {
+        axis->x *= kPuffScale;
+        axis->y *= kPuffScale;
+        axis->z *= kPuffScale;
+    }
+    out->pos = world;
+    RwMatrixUpdate(out);
+}
+
+static FxSystem_c* CreateHaze(CPlane* veh, const RwV3d& dummy) {
+    RwMatrix* root = RootMatrix(veh);
+    if (!root)
+        return nullptr;
+    RwV3d pos = dummy;
+    FxSystem_c* fx = g_fxMan.CreateFxSystem(const_cast<char*>("nitro"), &pos, root, true);
+    if (!fx)
+        return nullptr;
+    fx->SetLocalParticles(true);
+    fx->Play();
+    fx->EnablePrim(0, true);
+    fx->EnablePrim(1, false);
+    fx->EnablePrim(2, false);
+    fx->EnablePrim(3, false);
+    return fx;
+}
+
+static void StartPuff(CPlane* veh, ExhaustState& s, int i, const RwV3d& dummy) {
+    Kill(s.puff[i]);
+    s.puffMat[i] = NextPuffMatrix();
+    UpdatePuffMatrix(veh, s.puffMat[i], dummy);
+    RwV3d zero = { 0.0f, 0.0f, 0.0f };
+    s.puff[i] = g_fxMan.CreateFxSystem(const_cast<char*>("overheat_car"), &zero, s.puffMat[i], false);
+    if (!s.puff[i])
+        return;
+    s.puff[i]->SetConstTime(1, kPuffIntensity);
+    s.puff[i]->Play();
+}
+
+static void UpdateExhaust(CPlane* veh) {
+    if (!veh || !veh->m_pRwClump)
+        return;
+    auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(veh->m_nModelIndex));
+    if (!mi || !mi->m_pVehicleStruct)
+        return;
+
+    const CVector& d = mi->m_pVehicleStruct->m_avDummyPos[kExhaustDummyIndex];
+    if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f)
+        return;
+
+    const RwV3d dummies[2] = { { d.x, d.y, d.z }, { -d.x, d.y, d.z } };
+    const int   count = DoubleExhaust(veh) ? 2 : 1;
+
+    ExhaustState& s = g_exhaustStates[veh];
+    const bool on = EngineOn(veh);
+    if (!s.seen) {
+        s.seen = true;
+        s.engineWasOn = on;
+    }
+    if (on && !s.engineWasOn) {
+        for (int i = 0; i < count; i++)
+            StartPuff(veh, s, i, dummies[i]);
+        s.puffEnd = GetTickCount() + kPuffMs;
+    }
+    s.engineWasOn = on;
+
+    for (int i = 0; i < 2; i++) {
+        if (on && i < count) {
+            if (!s.haze[i])
+                s.haze[i] = CreateHaze(veh, dummies[i]);
+            if (s.haze[i])
+                s.haze[i]->SetConstTime(1, kHazeIntensity);
+        }
+        else {
+            Kill(s.haze[i]);
+        }
+
+        if (s.puff[i]) {
+            if (GetTickCount() >= s.puffEnd) {
+                Kill(s.puff[i]);
+            }
+            else {
+                UpdatePuffMatrix(veh, s.puffMat[i], dummies[i]);
+                s.puff[i]->SetConstTime(1, kPuffIntensity);
+            }
+        }
+    }
+}
+
+static void OnVehicleDestroyed(CVehicle* veh) {
+    auto it = g_exhaustStates.find(veh);
+    if (it == g_exhaustStates.end())
+        return;
+    for (int i = 0; i < 2; i++) {
+        Kill(it->second.haze[i]);
+        Kill(it->second.puff[i]);
+    }
+    g_exhaustStates.erase(it);
+}
+
+// =====================================================================
+// Combined PreRender (lights + exhaust)
+// =====================================================================
+static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
+    if (origPreRender)
+        origPreRender(self);
+
+    // Exhaust first — same timing as your original hook
+    UpdateExhaust(self);
+
+    if (self && self->m_pRwObject && self->m_matrix && HasMainLightDummies(self)) {
+        reinterpret_cast<LightsFn>(DO_VEHICLE_LIGHTS)(
+            self, reinterpret_cast<CMatrix*>(self->m_matrix), LIGHTS_TWIN);
+        UpdateLampTextures(self);
+    }
+}
+
+// =====================================================================
+// Install
+// =====================================================================
+class PlaneFeatures {
+public:
+    PlaneFeatures() {
+        origPreRender = reinterpret_cast<PlaneFn>(*reinterpret_cast<unsigned*>(PRERENDER_SLOT));
+        patch::SetPointer(PRERENDER_SLOT, reinterpret_cast<void*>(&CombinedPreRenderHook));
+
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            if (!veh || !veh->m_pRwClump)
+                return;
+            if (veh->m_nVehicleSubClass != VEHICLE_PLANE)
+                return;
+            auto* plane = static_cast<CPlane*>(veh);
+            RwFrame* al = plane->m_aCarNodes[PLANE_AILERON_L];
+            RwFrame* ar = plane->m_aCarNodes[PLANE_AILERON_R];
+            if (!al || !ar)
+                return;
+
+            ExtraAileronState& st = g_aileronStates[veh];
+            if (!st.searched) {
+                st.searched = true;
+                RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+                if (root) {
+                    st.l2 = FindFrameByName(root, "aileron_l2");
+                    st.r2 = FindFrameByName(root, "aileron_r2");
+                    st.p2 = FindFrameByName(root, "aileron2_pos");
+                }
+            }
+            if (!st.l2 || !st.r2 || !st.p2)
+                return;
+
+            SaveRest(al, st.restL);
+            SaveRest(ar, st.restR);
+            SaveRest(st.l2, st.restL2);
+            SaveRest(st.r2, st.restR2);
+            SaveRest(st.p2, st.restP2);
+
+            const RwV3d hingeR = st.restP2.pos;
+            const RwV3d hingeL = { -st.restP2.pos.x, st.restP2.pos.y, st.restP2.pos.z };
+            CopyOrientDelta(al, st.restL, st.l2, st.restL2, hingeL);
+            CopyOrientDelta(ar, st.restR, st.r2, st.restR2, hingeR);
+            };
+
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            if (!ShouldFixAlphaRef(veh))
+                return;
+            if (CGame::currArea != 0)
+                return;
+            void* current = nullptr;
+            RwRenderStateGet(rwRENDERSTATEALPHATESTFUNCTIONREF, &current);
+            const uintptr_t incoming = reinterpret_cast<uintptr_t>(current);
+            if (incoming == kStockEntityRef)
+                RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTIONREF,
+                    reinterpret_cast<void*>(kCarRef));
+            };
+
+        Events::vehicleDtorEvent += [](CVehicle* veh) {
+            auto it = g_seen.find(veh);
+            if (it != g_seen.end()) {
+                const int model = it->second;
+                g_seen.erase(it);
+                if (--g_liveCount[model] <= 0) {
+                    g_liveCount.erase(model);
+                    ReleaseModel(model);
+                }
+            }
+            g_aileronStates.erase(veh);
+            OnVehicleDestroyed(veh);
+            };
+    }
+} g_planeFeatures;
