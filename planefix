@@ -167,14 +167,38 @@ static void UpdateLampTextures(CPlane* self) {
     }
 }
 
-static bool HasMainLightDummies(CPlane* self) {
-    if (!self)
-        return false;
-    auto* vmi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
+static bool IsZeroDummy(const CVector& v) {
+    return v.x == 0.0f && v.y == 0.0f && v.z == 0.0f;
+}
+
+static void DoPlaneLightsSafe(CPlane* self) {
+    if (!self || !self->m_matrix)
+        return;
+
+    auto* vmi = static_cast<CVehicleModelInfo*>(
+        CModelInfo::GetModelInfo(self->m_nModelIndex));
     if (!vmi || !vmi->m_pVehicleStruct)
-        return false;
-    auto isZero = [](const CVector& v) { return v.x == 0.0f && v.y == 0.0f && v.z == 0.0f; };
-    return !(isZero(vmi->m_pVehicleStruct->m_avDummyPos[0]) && isZero(vmi->m_pVehicleStruct->m_avDummyPos[1]));
+        return;
+
+    CVector& d0 = vmi->m_pVehicleStruct->m_avDummyPos[0];
+    CVector& d1 = vmi->m_pVehicleStruct->m_avDummyPos[1];
+
+    const bool z0 = IsZeroDummy(d0);
+    const bool z1 = IsZeroDummy(d1);
+    if (z0 && z1)
+        return; // no main light dummies at all
+
+    // Park any missing dummy so DoVehicleLights cannot put a corona at the origin
+    const CVector parked = { 0.0f, 0.0f, -1000.0f };
+    CVector saved0, saved1;
+    if (z0) { saved0 = d0; d0 = parked; }
+    if (z1) { saved1 = d1; d1 = parked; }
+
+    reinterpret_cast<LightsFn>(DO_VEHICLE_LIGHTS)(
+        self, reinterpret_cast<CMatrix*>(self->m_matrix), LIGHTS_TWIN);
+
+    if (z0) d0 = saved0;
+    if (z1) d1 = saved1;
 }
 
 // =====================================================================
@@ -570,11 +594,11 @@ static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
 
     UpdateExhaust(self);
 
-    if (self && self->m_pRwObject && self->m_matrix && HasMainLightDummies(self)) {
-        reinterpret_cast<LightsFn>(DO_VEHICLE_LIGHTS)(
-            self, reinterpret_cast<CMatrix*>(self->m_matrix), LIGHTS_TWIN);
+    if (self && self->m_pRwObject)
+        DoPlaneLightsSafe(self);
+
+    if (self)
         UpdateLampTextures(self);
-    }
 }
 
 // =====================================================================
