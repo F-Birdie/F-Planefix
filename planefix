@@ -7,6 +7,7 @@
 // - Ground rolling wheels + stationary hubs that still steer (hub_lf/lb/rf/rb)
 // - Landing gear doors (landing_lf/rf/lr/rr_dummy)
 // - Hydra thruster offsets (thruster_f / thruster_r vs wheel_lm/rm_dummy)
+// - Hydra afterburner (jetthrust idle, flame + sparks on full thrust)
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include "CVehicleModelInfo.h"
 #include "CGame.h"
 #include "CTimer.h"
+#include "CPad.h"
 #include "FxManager_c.h"
 #include "FxSystem_c.h"
 #include "RenderWare.h"
@@ -39,6 +41,7 @@ constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
 constexpr unsigned SETUP_LIGHT_FLAGS = 0x4C8C90;
 constexpr unsigned LIGHTS_TWIN = 1;
 constexpr float   RAD2DEG = 180.0f / 3.14159265f;
+constexpr float   DEG2RAD = 3.14159265f / 180.0f;
 
 using PlaneFn = void(__thiscall*)(CPlane*);
 using LightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
@@ -788,10 +791,10 @@ static void UpdateHydraThrusters(CVehicle* veh) {
     };
 
     const RwV3d offs[4] = {
-        DeltaToOffset(dF),                       // 0 RF
-        DeltaToOffset({ -dF.x, dF.y, dF.z }),    // 1 LF
-        DeltaToOffset(dR),                       // 2 RR
-        DeltaToOffset({ -dR.x, dR.y, dR.z }),    // 3 LR
+        DeltaToOffset(dF),
+        DeltaToOffset({ -dF.x, dF.y, dF.z }),
+        DeltaToOffset(dR),
+        DeltaToOffset({ -dR.x, dR.y, dR.z }),
     };
 
     for (int i = 0; i < 4; i++) {
@@ -800,6 +803,242 @@ static void UpdateHydraThrusters(CVehicle* veh) {
             continue;
         RwV3d off = offs[i];
         fx->SetOffsetPos(&off);
+    }
+}
+
+// =====================================================================
+// 9) Hydra afterburner
+// =====================================================================
+static constexpr float IDLE_JT_RATE = 2.0f;
+static constexpr float IDLE_JT_PITCH_DEG = 0.0f;
+static constexpr float IDLE_JT_CONST_TIME = 0.5f;
+static constexpr float IDLE_JT_SCALE = 4.0f;
+
+static constexpr float FULL_JT_RATE = 3.0f;
+static constexpr float FULL_JT_PITCH_DEG = 0.0f;
+static constexpr float FULL_JT_CONST_TIME = 0.5f;
+static constexpr float FULL_JT_SCALE = 2.5f;
+
+static constexpr float FULL_FLAME_SCALE = 3.0f;
+static constexpr float FULL_FLAME_RATE = 10.0f;
+static constexpr float FULL_FLAME_AT_Y = -1.0f;
+
+static constexpr float FULL_SPARK_SCALE = 0.6f;
+static constexpr float FULL_SPARK_RATE = 1.5f;
+static constexpr float FULL_SPARK_AT_Y = -1.0f;
+
+static FxSystem_c* g_fxJT = nullptr;
+static FxSystem_c* g_fxFlame = nullptr;
+static FxSystem_c* g_fxSpark = nullptr;
+static CVehicle* g_abBound = nullptr;
+static RwMatrix g_jtParent;
+
+static bool GetAfterburnerLocalPos(CVehicle* veh, CVector& out) {
+    if (!veh || !veh->m_pRwClump)
+        return false;
+    RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+    if (!root)
+        return false;
+    RwFrame* ab = FindFrameByName(root, "afterburner");
+    if (!ab)
+        return false;
+    RwMatrix* m = RwFrameGetMatrix(ab);
+    if (!m)
+        return false;
+    out = { m->pos.x, m->pos.y, m->pos.z };
+    return true;
+}
+
+static void KillAbExtras() {
+    if (g_fxFlame) { g_fxFlame->Kill(); g_fxFlame = nullptr; }
+    if (g_fxSpark) { g_fxSpark->Kill(); g_fxSpark = nullptr; }
+}
+
+static void KillAfterburner() {
+    KillAbExtras();
+    if (g_fxJT) { g_fxJT->Kill(); g_fxJT = nullptr; }
+    g_abBound = nullptr;
+}
+
+static void MakeLocalOriented(RwMatrix& mat, const RwV3d& off, float scale, float atY) {
+    RwMatrixSetIdentity(&mat);
+    mat.right = { scale, 0.0f, 0.0f };
+    mat.up = { 0.0f, 0.0f, scale };
+    mat.at = { 0.0f, atY * scale, 0.0f };
+    mat.pos = off;
+}
+
+static void UpdatePitchedParent(RwMatrix& outParent, RwMatrix* vehMat,
+    const RwV3d& exhaustOff, float pitchDeg, float scale) {
+    const float r = pitchDeg * DEG2RAD;
+    const float c = cosf(r);
+    const float s = sinf(r);
+    const RwV3d R = vehMat->right;
+    const RwV3d U = vehMat->up;
+    const RwV3d A = vehMat->at;
+    outParent.right = { R.x * scale, R.y * scale, R.z * scale };
+    outParent.up.x = (U.x * c + A.x * s) * scale;
+    outParent.up.y = (U.y * c + A.y * s) * scale;
+    outParent.up.z = (U.z * c + A.z * s) * scale;
+    outParent.at.x = (-U.x * s + A.x * c) * scale;
+    outParent.at.y = (-U.y * s + A.y * c) * scale;
+    outParent.at.z = (-U.z * s + A.z * c) * scale;
+    outParent.pos.x = R.x * exhaustOff.x + U.x * exhaustOff.y + A.x * exhaustOff.z + vehMat->pos.x;
+    outParent.pos.y = R.y * exhaustOff.x + U.y * exhaustOff.y + A.y * exhaustOff.z + vehMat->pos.y;
+    outParent.pos.z = R.z * exhaustOff.x + U.z * exhaustOff.y + A.z * exhaustOff.z + vehMat->pos.z;
+}
+
+static FxSystem_c* CreateOnParent(const char* name, RwV3d* off, RwMatrix* parent,
+    float scale, float atY, float rate) {
+    RwMatrix local;
+    MakeLocalOriented(local, *off, scale, atY);
+    FxSystem_c* fx = g_fxMan.CreateFxSystem((char*)name, &local, parent, true);
+    if (!fx)
+        fx = g_fxMan.CreateFxSystem((char*)name, off, parent, true);
+    if (!fx && parent)
+        fx = g_fxMan.CreateFxSystem((char*)name, off, nullptr, true);
+    if (fx) {
+        fx->SetOffsetPos(off);
+        fx->SetLocalParticles(true);
+        fx->SetRateMult(rate);
+        fx->Play();
+    }
+    return fx;
+}
+
+static FxSystem_c* CreatePitched(const char* name, RwV3d* exhaustOff, RwMatrix* vehMat,
+    RwMatrix& parentStore, float pitchDeg, float rate, float constTime, float scale) {
+    UpdatePitchedParent(parentStore, vehMat, *exhaustOff, pitchDeg, scale);
+    RwV3d zero = { 0.0f, 0.0f, 0.0f };
+    FxSystem_c* fx = g_fxMan.CreateFxSystem((char*)name, &zero, &parentStore, true);
+    if (!fx)
+        return nullptr;
+    fx->m_pParentMatrix = &parentStore;
+    fx->SetOffsetPos(&zero);
+    fx->SetLocalParticles(true);
+    fx->SetRateMult(rate);
+    fx->SetConstTime(1, constTime);
+    fx->Play();
+    return fx;
+}
+
+static void UpdatePitched(FxSystem_c* fx, RwV3d* exhaustOff, RwMatrix* vehMat,
+    RwMatrix& parentStore, float pitchDeg, float rate, float constTime, float scale) {
+    if (!fx || !vehMat)
+        return;
+    UpdatePitchedParent(parentStore, vehMat, *exhaustOff, pitchDeg, scale);
+    fx->m_pParentMatrix = &parentStore;
+    RwV3d zero = { 0.0f, 0.0f, 0.0f };
+    fx->SetOffsetPos(&zero);
+    fx->SetLocalParticles(true);
+    fx->SetRateMult(rate);
+    fx->SetConstTime(1, constTime);
+}
+
+static bool IsHoldingGas(CVehicle* veh) {
+    CVehicle* playerVeh = FindPlayerVehicle(-1, false);
+    if (!playerVeh || playerVeh != veh)
+        return false;
+    CPad* pad = CPad::GetPad(0);
+    if (!pad)
+        return false;
+    return pad->GetAccelerate() > 0;
+}
+
+static constexpr float JET_MODE_TRIGGER_FRACTION = 0.5f;
+static constexpr float NOZZLE_HOVER_ANGLE = 5000.0f;
+static constexpr float NOZZLE_JET_ANGLE = 0.0f;
+
+static bool IsInJetMode(CPlane* plane) {
+    const float thresholdAngle = NOZZLE_HOVER_ANGLE
+        - (NOZZLE_HOVER_ANGLE - NOZZLE_JET_ANGLE) * JET_MODE_TRIGGER_FRACTION;
+    return (float)plane->m_wMiscComponentAngle <= thresholdAngle;
+}
+
+static bool IsFullThrust(CVehicle* veh) {
+    auto* plane = static_cast<CPlane*>(veh);
+    return IsInJetMode(plane) && IsHoldingGas(veh);
+}
+
+static void UpdateAfterburner(CVehicle* veh) {
+    if (!veh || veh->m_nModelIndex != MODEL_HYDRA) {
+        if (veh == g_abBound)
+            KillAfterburner();
+        return;
+    }
+
+    if (!EngineOn(veh)) {
+        if (veh == g_abBound)
+            KillAfterburner();
+        return;
+    }
+
+    auto* plane = static_cast<CPlane*>(veh);
+
+    FxSystem_c* stock = nullptr;
+    for (int i = 0; i < 4; i++) {
+        if (plane->m_apJettrusParticles[i]) {
+            stock = plane->m_apJettrusParticles[i];
+            break;
+        }
+    }
+    if (!stock)
+        return;
+
+    CVector local;
+    if (!GetAfterburnerLocalPos(veh, local))
+        return;
+
+    RwV3d off = { local.x, local.y, local.z };
+
+    CMatrix& cmat = veh->GetMatrix();
+    cmat.UpdateRW();
+    RwMatrix* vehMat = cmat.m_pAttachMatrix;
+    if (!vehMat && veh->m_pRwClump) {
+        if (RwFrame* root = RpClumpGetFrame(veh->m_pRwClump))
+            vehMat = RwFrameGetMatrix(root);
+    }
+    if (!vehMat)
+        return;
+
+    const bool full = IsFullThrust(veh);
+
+    if (g_abBound != veh) {
+        KillAfterburner();
+        g_abBound = veh;
+    }
+
+    const float jtRate = full ? FULL_JT_RATE : IDLE_JT_RATE;
+    const float jtPitch = full ? FULL_JT_PITCH_DEG : IDLE_JT_PITCH_DEG;
+    const float jtConst = full ? FULL_JT_CONST_TIME : IDLE_JT_CONST_TIME;
+    const float jtScale = full ? FULL_JT_SCALE : IDLE_JT_SCALE;
+
+    if (!g_fxJT)
+        g_fxJT = CreatePitched("jetthrust", &off, vehMat, g_jtParent,
+            jtPitch, jtRate, jtConst, jtScale);
+    else
+        UpdatePitched(g_fxJT, &off, vehMat, g_jtParent,
+            jtPitch, jtRate, jtConst, jtScale);
+
+    if (full) {
+        if (!g_fxFlame)
+            g_fxFlame = CreateOnParent("flame", &off, vehMat,
+                FULL_FLAME_SCALE, FULL_FLAME_AT_Y, FULL_FLAME_RATE);
+        else {
+            g_fxFlame->SetOffsetPos(&off);
+            g_fxFlame->SetRateMult(FULL_FLAME_RATE);
+        }
+
+        if (!g_fxSpark)
+            g_fxSpark = CreateOnParent("prt_spark_2", &off, vehMat,
+                FULL_SPARK_SCALE, FULL_SPARK_AT_Y, FULL_SPARK_RATE);
+        else {
+            g_fxSpark->SetOffsetPos(&off);
+            g_fxSpark->SetRateMult(FULL_SPARK_RATE);
+        }
+    }
+    else {
+        KillAbExtras();
     }
 }
 
@@ -893,6 +1132,10 @@ public:
             UpdateHydraThrusters(veh);
             };
 
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            UpdateAfterburner(veh);
+            };
+
         Events::vehicleDtorEvent += [](CVehicle* veh) {
             auto it = g_seen.find(veh);
             if (it != g_seen.end()) {
@@ -906,6 +1149,8 @@ public:
             g_aileronStates.erase(veh);
             g_hubStates.erase(veh);
             g_gearDoors.erase(veh);
+            if (veh == g_abBound)
+                KillAfterburner();
             OnVehicleDestroyed(veh);
             };
     }
