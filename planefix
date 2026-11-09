@@ -1,18 +1,20 @@
 // Combined plane features (plugin-sdk, GTA SA 1.0 US)
-// - Stock vehicle lights + lamp texture swap (CPlane::PreRender)
+// - Stock vehicle lights + lamp texture swap
 // - Extra ailerons (aileron_l2 / aileron_r2 hinged on aileron2_pos)
 // - Alpha-test ref fix for planes / helis / trains / boats
 // - Custom exhaust (startup puff + heat haze, optional double)
-// - Bonnet / boot openings via stock OpenDoor (redirects nodes to bonnet_dummy / boot_dummy)
-// - Ground rolling wheels + stationary hubs that still steer (hub_lf/lb/rf/rb)
-// - Landing gear doors (landing_lf/rf/lr/rr_dummy)
-// - Hydra thruster offsets (thruster_f / thruster_r vs wheel_lm/rm_dummy)
-// - Hydra afterburner (jetthrust idle, flame + sparks on full thrust)
+// - Bonnet / boot openings
+// - Ground rolling wheels + stationary hubs
+// - Landing gear doors
+// - Hydra thruster offsets
+// - Hydra afterburner
+// - Hydra missiles (pairs for unguided, 1/6/2/5/3/4 for homing)
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <windows.h>
 
@@ -24,6 +26,7 @@
 #include "CGame.h"
 #include "CTimer.h"
 #include "CPad.h"
+#include "CProjectileInfo.h"
 #include "FxManager_c.h"
 #include "FxSystem_c.h"
 #include "RenderWare.h"
@@ -70,8 +73,7 @@ static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
 // =====================================================================
 struct Marker { uint8_t r, g, b; };
 static const Marker kMarkers[4] = { {255,175,0}, {0,255,200}, {185,255,0}, {255,60,0} };
-
-static const char* kIgnoreFramePrefixes[] = { nullptr /* , "foglight" */ };
+static const char* kIgnoreFramePrefixes[] = { nullptr };
 
 struct LampMat {
     RpMaterial* mat;
@@ -180,15 +182,12 @@ static bool IsZeroDummy(const CVector& v) {
 static void DoPlaneLightsSafe(CPlane* self) {
     if (!self || !self->m_matrix)
         return;
-
-    auto* vmi = static_cast<CVehicleModelInfo*>(
-        CModelInfo::GetModelInfo(self->m_nModelIndex));
+    auto* vmi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
     if (!vmi || !vmi->m_pVehicleStruct)
         return;
 
     CVector& d0 = vmi->m_pVehicleStruct->m_avDummyPos[0];
     CVector& d1 = vmi->m_pVehicleStruct->m_avDummyPos[1];
-
     const bool z0 = IsZeroDummy(d0);
     const bool z1 = IsZeroDummy(d1);
     if (z0 && z1)
@@ -301,8 +300,7 @@ static constexpr uintptr_t kCarRef = 1;
 static bool ShouldFixAlphaRef(CVehicle* veh) {
     if (!veh)
         return false;
-    auto* mi = static_cast<CVehicleModelInfo*>(
-        CModelInfo::GetModelInfo(veh->m_nModelIndex));
+    auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(veh->m_nModelIndex));
     if (!mi)
         return false;
     switch (mi->m_nVehicleType) {
@@ -341,10 +339,7 @@ template <class T> auto DoubleExhaustImpl(const T* v, Pri2) -> decltype(bool(v->
 template <class T> auto DoubleExhaustImpl(const T* v, Pri1) -> decltype(bool(v->m_pHandlingData->m_nModelFlags & 0x2000)) {
     return (v->m_pHandlingData->m_nModelFlags & 0x2000) != 0;
 }
-template <class T> bool DoubleExhaustImpl(const T*, Pri0) {
-    static_assert(sizeof(T) == 0, "PlaneExhaust: could not find the handling model flags (m_bDoubleExhaust / m_nModelFlags) in your headers");
-    return false;
-}
+template <class T> bool DoubleExhaustImpl(const T*, Pri0) { return false; }
 static bool DoubleExhaust(const CVehicle* v) { return v->m_pHandlingData && DoubleExhaustImpl(v, Pri2{}); }
 
 struct ExhaustState {
@@ -492,13 +487,11 @@ static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componen
     if (door == DOOR_BONNET_ID || door == DOOR_BOOT_ID) {
         const bool bonnet = (door == DOOR_BONNET_ID);
         const int node = bonnet ? NODE_BONNET : NODE_BOOT;
-
         RwFrame* frame = nullptr;
         if (self->m_pRwClump)
             frame = FindFrameByName(RpClumpGetFrame(self->m_pRwClump), bonnet ? "bonnet_dummy" : "boot_dummy");
         if (!frame)
             return;
-
         RwFrame* saved = self->m_aCarNodes[node];
         self->m_aCarNodes[node] = frame;
         origOpenDoor(self, ped, node, door, ratio, playSound);
@@ -525,9 +518,7 @@ static void AddGroundRolling(CPlane* self) {
     auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
     if (!mi || !self->m_matrix)
         return;
-
     const CVector forward = self->m_matrix->up;
-
     for (int i = 0; i < 4; i++) {
         if (self->m_fWheelCounts[i] <= 0.0f)
             continue;
@@ -543,7 +534,6 @@ static void AddGroundRolling(CPlane* self) {
 static void UpdateHubs(CPlane* self) {
     if (!self->m_pRwClump)
         return;
-
     HubState& st = g_hubStates[self];
     if (!st.searched) {
         st.searched = true;
@@ -557,23 +547,19 @@ static void UpdateHubs(CPlane* self) {
         for (int i = 0; i < 4; i++)
             st.wheel[i] = self->m_aCarNodes[kWheelNode[i]];
     }
-
     for (int i = 0; i < 4; i++) {
         RwFrame* hub = st.hub[i];
         RwFrame* wheel = st.wheel[i];
         if (!hub || !wheel)
             continue;
-
         RwMatrix* hm = RwFrameGetMatrix(hub);
         RwMatrix* wm = RwFrameGetMatrix(wheel);
         if (!hm || !wm)
             continue;
-
         hm->right = wm->right;
         hm->up = wm->up;
         hm->at = wm->at;
         hm->pos = wm->pos;
-
         const float deg = kSpinSign[i] * self->m_fWheelRotation[i] * RAD2DEG;
         const RwV3d xAxis = { 1.0f, 0.0f, 0.0f };
         RwMatrixRotate(hm, &xAxis, deg, rwCOMBINEPRECONCAT);
@@ -606,7 +592,6 @@ static const DoorCfg kGearDoors[4] = {
 template <class T> auto GearRefImpl(T* p, Pri2) -> decltype((p->m_LandingGearAngle)) { return p->m_LandingGearAngle; }
 template <class T> auto GearRefImpl(T* p, Pri1) -> decltype((p->m_fLandingGearStatus)) { return p->m_fLandingGearStatus; }
 template <class T> float& GearRefImpl(T*, Pri0) {
-    static_assert(sizeof(T) == 0, "LandingGearDoors: could not find the landing gear member (m_LandingGearAngle / m_fLandingGearStatus) in CPlane");
     static float unused;
     return unused;
 }
@@ -620,7 +605,6 @@ struct PlaneGearDoors {
     RpClump* clump = nullptr;
     bool     any = false;
     GearDoor doors[4];
-
     bool  seen = false;
     bool  wasUp = false;
     float open = 0.0f;
@@ -631,19 +615,19 @@ struct PlaneGearDoors {
 };
 static std::unordered_map<CVehicle*, PlaneGearDoors> g_gearDoors;
 
-struct FindCtx {
+struct GearFindCtx {
     const char* name;
     RwFrame* found;
 };
 
-static RwFrame* FindFrameCB(RwFrame* frame, void* data) {
-    auto* ctx = static_cast<FindCtx*>(data);
+static RwFrame* GearFindFrameCB(RwFrame* frame, void* data) {
+    auto* ctx = static_cast<GearFindCtx*>(data);
     const char* n = GetFrameNodeName(frame);
     if (n && _stricmp(n, ctx->name) == 0) {
         ctx->found = frame;
         return nullptr;
     }
-    RwFrameForAllChildren(frame, FindFrameCB, ctx);
+    RwFrameForAllChildren(frame, GearFindFrameCB, ctx);
     return ctx->found ? nullptr : frame;
 }
 
@@ -651,15 +635,14 @@ static void UpdateGearDoors(CPlane* veh) {
     RpClump* clump = veh->m_pRwClump;
     if (!clump)
         return;
-
     PlaneGearDoors& pd = g_gearDoors[veh];
     if (pd.clump != clump) {
         pd.clump = clump;
         pd.any = false;
         pd.lastApplied = -1.0f;
         for (int i = 0; i < 4; i++) {
-            FindCtx ctx = { kGearDoors[i].name, nullptr };
-            RwFrameForAllChildren(RpClumpGetFrame(clump), FindFrameCB, &ctx);
+            GearFindCtx ctx = { kGearDoors[i].name, nullptr };
+            RwFrameForAllChildren(RpClumpGetFrame(clump), GearFindFrameCB, &ctx);
             pd.doors[i].frame = ctx.found;
             if (ctx.found) {
                 pd.doors[i].rest = *RwFrameGetMatrix(ctx.found);
@@ -743,7 +726,7 @@ static void UpdateGearDoors(CPlane* veh) {
 }
 
 // =====================================================================
-// 8) Hydra thrusters (offsets only)
+// 8) Hydra thrusters
 // =====================================================================
 static bool GetNamedPos(RwFrame* root, const char* name, CVector& out) {
     RwFrame* f = FindFrameByName(root, name);
@@ -763,7 +746,6 @@ static RwV3d DeltaToOffset(const CVector& d) {
 static void UpdateHydraThrusters(CVehicle* veh) {
     if (!veh || veh->m_nModelIndex != MODEL_HYDRA || !veh->m_pRwClump)
         return;
-
     auto* plane = static_cast<CPlane*>(veh);
     RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
     if (!root)
@@ -779,24 +761,14 @@ static void UpdateHydraThrusters(CVehicle* veh) {
     if (!GetNamedPos(root, "thruster_r", thrR))
         return;
 
-    const CVector dF = {
-        thrF.x - pivotF.x,
-        thrF.y - pivotF.y,
-        thrF.z - pivotF.z
-    };
-    const CVector dR = {
-        thrR.x - pivotR.x,
-        thrR.y - pivotR.y,
-        thrR.z - pivotR.z
-    };
-
+    const CVector dF = { thrF.x - pivotF.x, thrF.y - pivotF.y, thrF.z - pivotF.z };
+    const CVector dR = { thrR.x - pivotR.x, thrR.y - pivotR.y, thrR.z - pivotR.z };
     const RwV3d offs[4] = {
         DeltaToOffset(dF),
         DeltaToOffset({ -dF.x, dF.y, dF.z }),
         DeltaToOffset(dR),
         DeltaToOffset({ -dR.x, dR.y, dR.z }),
     };
-
     for (int i = 0; i < 4; i++) {
         FxSystem_c* fx = plane->m_apJettrusParticles[i];
         if (!fx)
@@ -813,16 +785,13 @@ static constexpr float IDLE_JT_RATE = 2.0f;
 static constexpr float IDLE_JT_PITCH_DEG = 0.0f;
 static constexpr float IDLE_JT_CONST_TIME = 0.5f;
 static constexpr float IDLE_JT_SCALE = 4.0f;
-
 static constexpr float FULL_JT_RATE = 3.0f;
 static constexpr float FULL_JT_PITCH_DEG = 0.0f;
 static constexpr float FULL_JT_CONST_TIME = 0.5f;
 static constexpr float FULL_JT_SCALE = 2.5f;
-
 static constexpr float FULL_FLAME_SCALE = 3.0f;
 static constexpr float FULL_FLAME_RATE = 10.0f;
 static constexpr float FULL_FLAME_AT_Y = -1.0f;
-
 static constexpr float FULL_SPARK_SCALE = 0.6f;
 static constexpr float FULL_SPARK_RATE = 1.5f;
 static constexpr float FULL_SPARK_AT_Y = -1.0f;
@@ -966,15 +935,12 @@ static void UpdateAfterburner(CVehicle* veh) {
             KillAfterburner();
         return;
     }
-
     if (!EngineOn(veh)) {
         if (veh == g_abBound)
             KillAfterburner();
         return;
     }
-
     auto* plane = static_cast<CPlane*>(veh);
-
     FxSystem_c* stock = nullptr;
     for (int i = 0; i < 4; i++) {
         if (plane->m_apJettrusParticles[i]) {
@@ -988,7 +954,6 @@ static void UpdateAfterburner(CVehicle* veh) {
     CVector local;
     if (!GetAfterburnerLocalPos(veh, local))
         return;
-
     RwV3d off = { local.x, local.y, local.z };
 
     CMatrix& cmat = veh->GetMatrix();
@@ -1002,7 +967,6 @@ static void UpdateAfterburner(CVehicle* veh) {
         return;
 
     const bool full = IsFullThrust(veh);
-
     if (g_abBound != veh) {
         KillAfterburner();
         g_abBound = veh;
@@ -1014,24 +978,19 @@ static void UpdateAfterburner(CVehicle* veh) {
     const float jtScale = full ? FULL_JT_SCALE : IDLE_JT_SCALE;
 
     if (!g_fxJT)
-        g_fxJT = CreatePitched("jetthrust", &off, vehMat, g_jtParent,
-            jtPitch, jtRate, jtConst, jtScale);
+        g_fxJT = CreatePitched("jetthrust", &off, vehMat, g_jtParent, jtPitch, jtRate, jtConst, jtScale);
     else
-        UpdatePitched(g_fxJT, &off, vehMat, g_jtParent,
-            jtPitch, jtRate, jtConst, jtScale);
+        UpdatePitched(g_fxJT, &off, vehMat, g_jtParent, jtPitch, jtRate, jtConst, jtScale);
 
     if (full) {
         if (!g_fxFlame)
-            g_fxFlame = CreateOnParent("flame", &off, vehMat,
-                FULL_FLAME_SCALE, FULL_FLAME_AT_Y, FULL_FLAME_RATE);
+            g_fxFlame = CreateOnParent("flame", &off, vehMat, FULL_FLAME_SCALE, FULL_FLAME_AT_Y, FULL_FLAME_RATE);
         else {
             g_fxFlame->SetOffsetPos(&off);
             g_fxFlame->SetRateMult(FULL_FLAME_RATE);
         }
-
         if (!g_fxSpark)
-            g_fxSpark = CreateOnParent("prt_spark_2", &off, vehMat,
-                FULL_SPARK_SCALE, FULL_SPARK_AT_Y, FULL_SPARK_RATE);
+            g_fxSpark = CreateOnParent("prt_spark_2", &off, vehMat, FULL_SPARK_SCALE, FULL_SPARK_AT_Y, FULL_SPARK_RATE);
         else {
             g_fxSpark->SetOffsetPos(&off);
             g_fxSpark->SetRateMult(FULL_SPARK_RATE);
@@ -1043,26 +1002,369 @@ static void UpdateAfterburner(CVehicle* veh) {
 }
 
 // =====================================================================
+// 10) Hydra missiles
+// =====================================================================
+constexpr unsigned CPLANE_VMT = 0x871948;
+constexpr unsigned FIRE_UNGUIDED = 0x6D5110;
+constexpr unsigned FIRE_HEAT_SEEKING = 0x6E05C0;
+constexpr unsigned GET_ORDNANCE_POS = 0x6D46E0;
+constexpr unsigned GET_ORDNANCE_RATE = 0x6D4590;
+constexpr int kOrdnancePrimary = 1;
+constexpr int kOrdnanceSecondary = 2;
+constexpr int kProjectileRocketHS = 20;
+
+constexpr float kLaunchSec = 0.12f;
+constexpr float kLaunchDistance = 0.5f;
+constexpr float kRespawnSec = 3.0f;
+constexpr float kReloadSec = 0.4f;
+constexpr float kReloadDistance = 0.5f;
+constexpr float kSpawnOffsetX = 0.0f;
+constexpr float kSpawnOffsetY = 0.0f;
+constexpr float kSpawnOffsetZ = 0.0f;
+
+static const char* kMissileNames[6] = { "missile1", "missile2", "missile3", "missile4", "missile5", "missile6" };
+static const int   kPairs[3][2] = { { 0, 5 }, { 1, 4 }, { 2, 3 } };
+static const int   kSingleOrder[6] = { 0, 5, 1, 4, 2, 3 };
+
+using FireUnguidedFn = void(__thiscall*)(CVehicle*, int, bool);
+using FireHeatFn = void(__thiscall*)(CVehicle*, CEntity*, int, bool);
+using GetOrdnancePosFn = CVector * (__thiscall*)(CVehicle*, CVector*, int);
+using RateFn = uint32_t(__thiscall*)(CVehicle*, int);
+
+static FireUnguidedFn   origFireUnguided = reinterpret_cast<FireUnguidedFn>(FIRE_UNGUIDED);
+static FireHeatFn       origFireHeat = reinterpret_cast<FireHeatFn>(FIRE_HEAT_SEEKING);
+static GetOrdnancePosFn origGetOrdnancePos = reinterpret_cast<GetOrdnancePosFn>(GET_ORDNANCE_POS);
+
+using AtomicList = std::vector<std::pair<RpAtomic*, unsigned>>;
+enum MissileMode { MRest, MLaunch, MHidden, MReload };
+
+struct Missile {
+    RwFrame* frame = nullptr;
+    AtomicList atomics;
+    RwMatrix   rest;
+    CVector    pos;
+    MissileMode mode = MRest;
+    float      t = 0.0f;
+};
+
+struct MissileState {
+    RpClump* clump = nullptr;
+    bool     ok = false;
+    Missile  m[6];
+    int      nextPair = 0;
+    int      nextSingle = 0;
+    float    sinceShot[3] = { 1000.0f, 1000.0f, 1000.0f };
+    bool     pending = false;
+    float    pendingLeft = 0.0f;
+    int      pendingType = 0;
+    CEntity* pendingTarget = nullptr;
+    int      shotIdx[2] = { 0, 0 };
+    int      shotN = 0;
+    bool     firing = false;
+};
+static std::unordered_map<CVehicle*, MissileState> g_missileStates;
+
+struct MissileFindCtx {
+    const char* name;
+    RwFrame* found;
+};
+
+static RwFrame* MissileFindFrameCB(RwFrame* frame, void* data) {
+    auto* ctx = static_cast<MissileFindCtx*>(data);
+    const char* n = GetFrameNodeName(frame);
+    if (n && _stricmp(n, ctx->name) == 0) {
+        ctx->found = frame;
+        return nullptr;
+    }
+    RwFrameForAllChildren(frame, MissileFindFrameCB, ctx);
+    return ctx->found ? nullptr : frame;
+}
+
+static RwObject* MissileObjectCB(RwObject* obj, void* data) {
+    if (RwObjectGetType(obj) == rpATOMIC) {
+        auto* atomic = reinterpret_cast<RpAtomic*>(obj);
+        static_cast<AtomicList*>(data)->push_back({ atomic, (unsigned)RpAtomicGetFlags(atomic) });
+    }
+    return obj;
+}
+
+static RwFrame* MissileChildCB(RwFrame* frame, void* data) {
+    RwFrameForAllObjects(frame, MissileObjectCB, data);
+    RwFrameForAllChildren(frame, MissileChildCB, data);
+    return frame;
+}
+
+static void CollectMissileAtomics(RwFrame* frame, AtomicList& out) {
+    RwFrameForAllObjects(frame, MissileObjectCB, &out);
+    RwFrameForAllChildren(frame, MissileChildCB, &out);
+}
+
+static CVector MissileLocalPos(RpClump* clump, RwFrame* frame) {
+    RwFrame* root = RpClumpGetFrame(clump);
+    RwV3d p = RwFrameGetMatrix(frame)->pos;
+    for (RwFrame* f = RwFrameGetParent(frame); f && f != root; f = RwFrameGetParent(f))
+        RwV3dTransformPoints(&p, &p, 1, RwFrameGetMatrix(f));
+    return CVector(p.x, p.y, p.z);
+}
+
+static void SetMissileVisible(Missile& m, bool visible) {
+    for (auto& a : m.atomics)
+        RpAtomicSetFlags(a.first, visible ? a.second : 0);
+}
+
+static void ApplyMissileOffset(Missile& m, float offsetY) {
+    RwMatrix* mat = RwFrameGetMatrix(m.frame);
+    *mat = m.rest;
+    mat->pos.y += offsetY;
+    RwMatrixUpdate(mat);
+    RwFrameUpdateObjects(m.frame);
+}
+
+static void ClearMissileTarget(MissileState& st) {
+    if (st.pendingTarget) {
+        st.pendingTarget->CleanUpOldReference(&st.pendingTarget);
+        st.pendingTarget = nullptr;
+    }
+}
+
+static void BuildMissiles(MissileState& st, RpClump* clump) {
+    ClearMissileTarget(st);
+    st.clump = clump;
+    st.ok = false;
+    st.nextPair = 0;
+    st.nextSingle = 0;
+    st.sinceShot[kOrdnancePrimary] = 1000.0f;
+    st.sinceShot[kOrdnanceSecondary] = 1000.0f;
+    st.pending = false;
+    st.firing = false;
+    for (int i = 0; i < 6; i++) {
+        Missile& m = st.m[i];
+        m = Missile();
+        MissileFindCtx ctx = { kMissileNames[i], nullptr };
+        RwFrameForAllChildren(RpClumpGetFrame(clump), MissileFindFrameCB, &ctx);
+        if (!ctx.found)
+            return;
+        m.frame = ctx.found;
+        m.rest = *RwFrameGetMatrix(ctx.found);
+        m.pos = MissileLocalPos(clump, ctx.found);
+        CollectMissileAtomics(ctx.found, m.atomics);
+    }
+    st.ok = true;
+}
+
+static bool IsPlaneVmt(CVehicle* v) {
+    return *reinterpret_cast<unsigned*>(v) == CPLANE_VMT;
+}
+
+static MissileState* GetMissileState(CPlane* veh) {
+    RpClump* clump = veh->m_pRwClump;
+    if (!clump)
+        return nullptr;
+    MissileState& st = g_missileStates[veh];
+    if (st.clump != clump)
+        BuildMissiles(st, clump);
+    return st.ok ? &st : nullptr;
+}
+
+static float Sq(float x) { return x * x; }
+
+static void UpdateMissile(Missile& m, float dt) {
+    switch (m.mode) {
+    case MLaunch: {
+        m.t += dt;
+        ApplyMissileOffset(m, kLaunchDistance * Sq(std::min(m.t / kLaunchSec, 1.0f)));
+        break;
+    }
+    case MHidden: {
+        m.t -= dt;
+        if (m.t <= 0.0f) {
+            SetMissileVisible(m, true);
+            if (kReloadSec > 0.0f) {
+                m.mode = MReload;
+                m.t = 0.0f;
+                ApplyMissileOffset(m, -kReloadDistance);
+            }
+            else {
+                m.mode = MRest;
+                ApplyMissileOffset(m, 0.0f);
+            }
+        }
+        break;
+    }
+    case MReload: {
+        m.t += dt;
+        const float k = std::min(m.t / kReloadSec, 1.0f);
+        ApplyMissileOffset(m, -kReloadDistance * Sq(1.0f - k));
+        if (k >= 1.0f) {
+            m.mode = MRest;
+            ApplyMissileOffset(m, 0.0f);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void BeginShot(MissileState& st, int type, CEntity* target) {
+    st.sinceShot[type] = 0.0f;
+    st.pending = true;
+    st.pendingLeft = kLaunchSec;
+    st.pendingType = type;
+    ClearMissileTarget(st);
+    if (target) {
+        st.pendingTarget = target;
+        target->RegisterReference(&st.pendingTarget);
+    }
+    if (type == kOrdnanceSecondary) {
+        int pick = -1;
+        for (int n = 0; n < 6; n++) {
+            const int k = (st.nextSingle + n) % 6;
+            if (st.m[kSingleOrder[k]].mode == MRest) {
+                pick = k;
+                break;
+            }
+        }
+        if (pick < 0)
+            pick = st.nextSingle;
+        st.nextSingle = (pick + 1) % 6;
+        st.shotIdx[0] = kSingleOrder[pick];
+        st.shotN = 1;
+    }
+    else {
+        st.shotIdx[0] = kPairs[st.nextPair][0];
+        st.shotIdx[1] = kPairs[st.nextPair][1];
+        st.nextPair = (st.nextPair + 1) % 3;
+        st.shotN = 2;
+    }
+    for (int i = 0; i < st.shotN; i++) {
+        Missile& m = st.m[st.shotIdx[i]];
+        m.mode = MLaunch;
+        m.t = 0.0f;
+    }
+}
+
+static void FireHoming(CVehicle* veh, const MissileState& st, CEntity* target) {
+    const RwV3d& up = veh->m_matrix->up;
+    CVector forward(up.x, up.y, up.z);
+    const CVector& v = veh->m_vecMoveSpeed;
+    float along = v.x * forward.x + v.y * forward.y + v.z * forward.z;
+    if (along < 0.0f)
+        along = 0.0f;
+    const float carry = along * CTimer::ms_fTimeStep;
+    for (int i = 0; i < st.shotN; i++) {
+        const CVector& p = st.m[st.shotIdx[i]].pos;
+        const CVector local(p.x + (p.x >= 0.0f ? kSpawnOffsetX : -kSpawnOffsetX),
+            p.y + kLaunchDistance + kSpawnOffsetY,
+            p.z + kSpawnOffsetZ);
+        CVector world = veh->TransformFromObjectSpace(local);
+        world.x += forward.x * carry;
+        world.y += forward.y * carry;
+        world.z += forward.z * carry;
+        CProjectileInfo::AddProjectile(veh, static_cast<eWeaponType>(kProjectileRocketHS), world, 0.0f, &forward, target);
+    }
+}
+
+static void FireShot(CVehicle* veh, MissileState& st) {
+    st.pending = false;
+    for (int i = 0; i < st.shotN; i++) {
+        Missile& m = st.m[st.shotIdx[i]];
+        ApplyMissileOffset(m, 0.0f);
+        SetMissileVisible(m, false);
+        m.mode = MHidden;
+        m.t = kRespawnSec;
+    }
+    if (st.pendingType == kOrdnanceSecondary) {
+        FireHoming(veh, st, st.pendingTarget);
+        ClearMissileTarget(st);
+    }
+    else {
+        st.firing = true;
+        origFireUnguided(veh, st.pendingType, false);
+        st.firing = false;
+    }
+}
+
+static void UpdateMissileState(CVehicle* veh, MissileState& st, float dt) {
+    st.sinceShot[kOrdnancePrimary] += dt;
+    st.sinceShot[kOrdnanceSecondary] += dt;
+    for (Missile& m : st.m)
+        UpdateMissile(m, dt);
+    if (st.pending) {
+        st.pendingLeft -= dt;
+        if (st.pendingLeft <= 0.0f)
+            FireShot(veh, st);
+    }
+}
+
+static void __fastcall FireUnguidedHook(CVehicle* self, void*, int type, bool useRateLimit) {
+    if (type == kOrdnancePrimary && IsPlaneVmt(self)) {
+        if (MissileState* st = GetMissileState(static_cast<CPlane*>(self))) {
+            if (st->pending)
+                return;
+            if (useRateLimit && st->sinceShot[type] < reinterpret_cast<RateFn>(GET_ORDNANCE_RATE)(self, type) / 1000.0f)
+                return;
+            BeginShot(*st, type, nullptr);
+            return;
+        }
+    }
+    origFireUnguided(self, type, useRateLimit);
+}
+
+static void __fastcall FireHeatHook(CVehicle* self, void*, CEntity* target, int type, bool useRateLimit) {
+    if (type == kOrdnanceSecondary && IsPlaneVmt(self)) {
+        if (MissileState* st = GetMissileState(static_cast<CPlane*>(self))) {
+            if (st->pending)
+                return;
+            if (useRateLimit && st->sinceShot[type] < reinterpret_cast<RateFn>(GET_ORDNANCE_RATE)(self, type) / 1000.0f)
+                return;
+            BeginShot(*st, type, target);
+            return;
+        }
+    }
+    origFireHeat(self, target, type, useRateLimit);
+}
+
+static CVector* __fastcall OrdnancePosHook(CVehicle* self, void*, CVector* out, int type) {
+    CVector* result = origGetOrdnancePos(self, out, type);
+    if (type != kOrdnancePrimary || !IsPlaneVmt(self))
+        return result;
+    const auto it = g_missileStates.find(self);
+    if (it == g_missileStates.end() || !it->second.firing)
+        return result;
+    const MissileState& st = it->second;
+    const CVector& p = st.m[st.shotIdx[0]].pos;
+    result->x = std::fabs(p.x) + kSpawnOffsetX;
+    result->y = p.y + kLaunchDistance + kSpawnOffsetY;
+    result->z = p.z + kSpawnOffsetZ;
+    return result;
+}
+
+static void RedirectCalls(unsigned target, void* hook) {
+    for (unsigned a = 0x401000; a < 0x857000 - 5; ++a) {
+        if (*reinterpret_cast<const uint8_t*>(a) != 0xE8)
+            continue;
+        const int32_t rel = *reinterpret_cast<const int32_t*>(a + 1);
+        if (a + 5 + rel == target)
+            patch::RedirectCall(a, hook);
+    }
+}
+
+// =====================================================================
 // Combined PreRender
 // =====================================================================
 static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
     if (self)
         UpdateGearDoors(self);
-
     if (self && self->m_pRwObject && self->m_matrix)
         AddGroundRolling(self);
-
     if (origPreRender)
         origPreRender(self);
-
     if (self && self->m_pRwObject)
         UpdateHubs(self);
-
     UpdateExhaust(self);
-
     if (self && self->m_pRwObject)
         DoPlaneLightsSafe(self);
-
     if (self)
         UpdateLampTextures(self);
 }
@@ -1079,6 +1381,10 @@ public:
         origOpenDoor = reinterpret_cast<OpenDoorFn>(*reinterpret_cast<unsigned*>(OPENDOOR_SLOT));
         patch::SetPointer(OPENDOOR_SLOT, reinterpret_cast<void*>(&OpenDoorHook));
 
+        RedirectCalls(FIRE_UNGUIDED, reinterpret_cast<void*>(&FireUnguidedHook));
+        RedirectCalls(FIRE_HEAT_SEEKING, reinterpret_cast<void*>(&FireHeatHook));
+        RedirectCalls(GET_ORDNANCE_POS, reinterpret_cast<void*>(&OrdnancePosHook));
+
         Events::vehicleRenderEvent += [](CVehicle* veh) {
             if (!veh || !veh->m_pRwClump)
                 return;
@@ -1089,7 +1395,6 @@ public:
             RwFrame* ar = plane->m_aCarNodes[PLANE_AILERON_R];
             if (!al || !ar)
                 return;
-
             ExtraAileronState& st = g_aileronStates[veh];
             if (!st.searched) {
                 st.searched = true;
@@ -1102,13 +1407,11 @@ public:
             }
             if (!st.l2 || !st.r2 || !st.p2)
                 return;
-
             SaveRest(al, st.restL);
             SaveRest(ar, st.restR);
             SaveRest(st.l2, st.restL2);
             SaveRest(st.r2, st.restR2);
             SaveRest(st.p2, st.restP2);
-
             const RwV3d hingeR = st.restP2.pos;
             const RwV3d hingeL = { -st.restP2.pos.x, st.restP2.pos.y, st.restP2.pos.z };
             CopyOrientDelta(al, st.restL, st.l2, st.restL2, hingeL);
@@ -1124,8 +1427,7 @@ public:
             RwRenderStateGet(rwRENDERSTATEALPHATESTFUNCTIONREF, &current);
             const uintptr_t incoming = reinterpret_cast<uintptr_t>(current);
             if (incoming == kStockEntityRef)
-                RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTIONREF,
-                    reinterpret_cast<void*>(kCarRef));
+                RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTIONREF, reinterpret_cast<void*>(kCarRef));
             };
 
         Events::vehicleRenderEvent += [](CVehicle* veh) {
@@ -1134,6 +1436,14 @@ public:
 
         Events::vehicleRenderEvent += [](CVehicle* veh) {
             UpdateAfterburner(veh);
+            };
+
+        Events::gameProcessEvent += [] {
+            const float dt = CTimer::ms_fTimeStep / 50.0f;
+            for (auto& entry : g_missileStates) {
+                if (entry.second.ok)
+                    UpdateMissileState(entry.first, entry.second, dt);
+            }
             };
 
         Events::vehicleDtorEvent += [](CVehicle* veh) {
@@ -1152,6 +1462,12 @@ public:
             if (veh == g_abBound)
                 KillAfterburner();
             OnVehicleDestroyed(veh);
+
+            auto mit = g_missileStates.find(veh);
+            if (mit != g_missileStates.end()) {
+                ClearMissileTarget(mit->second);
+                g_missileStates.erase(mit);
+            }
             };
     }
 } g_planeFeatures;
