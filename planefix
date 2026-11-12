@@ -1,6 +1,7 @@
 // Combined plane features (plugin-sdk, GTA SA 1.0 US)
 // - Stock vehicle lights + lamp texture swap
 // - Extra ailerons (aileron_l2 / aileron_r2 hinged on aileron2_pos)
+// - Second rudder (rudder2 hinged on rudder2_pos, scale 3.0, inverted)
 // - Alpha-test ref fix for planes / helis / trains / boats
 // - Custom exhaust (startup puff + heat haze, optional double)
 // - Bonnet / boot openings
@@ -12,7 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
+#include <cmath> 
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -206,8 +207,11 @@ static void DoPlaneLightsSafe(CPlane* self) {
 }
 
 // =====================================================================
-// 2) Extra ailerons
+// 2) Extra ailerons + second rudder
 // =====================================================================
+constexpr int   PLANE_RUDDER_NODE = 16;
+constexpr float kRudder2AngleScale = 3.0f;
+
 struct RestMat {
     bool valid = false;
     RwV3d right{}, up{}, at{}, pos{};
@@ -219,7 +223,14 @@ struct ExtraAileronState {
     RwFrame* p2 = nullptr;
     RestMat restL, restR, restL2, restR2, restP2;
 };
+struct ExtraRudderState {
+    bool searched = false;
+    RwFrame* r2 = nullptr;
+    RwFrame* p2 = nullptr;
+    RestMat restR, restR2, restP2;
+};
 static std::unordered_map<CVehicle*, ExtraAileronState> g_aileronStates;
+static std::unordered_map<CVehicle*, ExtraRudderState>  g_rudderStates;
 
 static void SaveRest(RwFrame* f, RestMat& out) {
     if (!f || out.valid)
@@ -250,7 +261,8 @@ static RwV3d RotateAroundAxis(const RwV3d& v, const RwV3d& a, float c, float s) 
 }
 
 static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
-    RwFrame* dst, const RestMat& dstRest, const RwV3d& hingeEnd) {
+    RwFrame* dst, const RestMat& dstRest, const RwV3d& hingeEnd,
+    float sign = 1.0f, float scale = 1.0f) {
     if (!src || !dst || !srcRest.valid || !dstRest.valid)
         return;
     RwMatrix* sm = RwFrameGetMatrix(src);
@@ -261,7 +273,7 @@ static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
     const RwV3d u = sm->up;
     const float dUpY = srcRest.up.x * u.x + srcRest.up.y * u.y + srcRest.up.z * u.z;
     const float dUpZ = srcRest.at.x * u.x + srcRest.at.y * u.y + srcRest.at.z * u.z;
-    const float angle = atan2f(dUpZ, dUpY);
+    const float angle = atan2f(dUpZ, dUpY) * sign * scale;
     const float c = cosf(angle);
     const float s = sinf(angle);
 
@@ -1391,31 +1403,49 @@ public:
             if (veh->m_nVehicleSubClass != VEHICLE_PLANE)
                 return;
             auto* plane = static_cast<CPlane*>(veh);
+            RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+
+            // Extra ailerons
             RwFrame* al = plane->m_aCarNodes[PLANE_AILERON_L];
             RwFrame* ar = plane->m_aCarNodes[PLANE_AILERON_R];
-            if (!al || !ar)
-                return;
-            ExtraAileronState& st = g_aileronStates[veh];
-            if (!st.searched) {
-                st.searched = true;
-                RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
-                if (root) {
+            if (al && ar && root) {
+                ExtraAileronState& st = g_aileronStates[veh];
+                if (!st.searched) {
+                    st.searched = true;
                     st.l2 = FindFrameByName(root, "aileron_l2");
                     st.r2 = FindFrameByName(root, "aileron_r2");
                     st.p2 = FindFrameByName(root, "aileron2_pos");
                 }
+                if (st.l2 && st.r2 && st.p2) {
+                    SaveRest(al, st.restL);
+                    SaveRest(ar, st.restR);
+                    SaveRest(st.l2, st.restL2);
+                    SaveRest(st.r2, st.restR2);
+                    SaveRest(st.p2, st.restP2);
+                    const RwV3d hingeR = st.restP2.pos;
+                    const RwV3d hingeL = { -st.restP2.pos.x, st.restP2.pos.y, st.restP2.pos.z };
+                    CopyOrientDelta(al, st.restL, st.l2, st.restL2, hingeL);
+                    CopyOrientDelta(ar, st.restR, st.r2, st.restR2, hingeR);
+                }
             }
-            if (!st.l2 || !st.r2 || !st.p2)
-                return;
-            SaveRest(al, st.restL);
-            SaveRest(ar, st.restR);
-            SaveRest(st.l2, st.restL2);
-            SaveRest(st.r2, st.restR2);
-            SaveRest(st.p2, st.restP2);
-            const RwV3d hingeR = st.restP2.pos;
-            const RwV3d hingeL = { -st.restP2.pos.x, st.restP2.pos.y, st.restP2.pos.z };
-            CopyOrientDelta(al, st.restL, st.l2, st.restL2, hingeL);
-            CopyOrientDelta(ar, st.restR, st.r2, st.restR2, hingeR);
+
+            // Second rudder
+            RwFrame* stockRudder = plane->m_aCarNodes[PLANE_RUDDER_NODE];
+            if (stockRudder && root) {
+                ExtraRudderState& rs = g_rudderStates[veh];
+                if (!rs.searched) {
+                    rs.searched = true;
+                    rs.r2 = FindFrameByName(root, "rudder2");
+                    rs.p2 = FindFrameByName(root, "rudder2_pos");
+                }
+                if (rs.r2 && rs.p2) {
+                    SaveRest(stockRudder, rs.restR);
+                    SaveRest(rs.r2, rs.restR2);
+                    SaveRest(rs.p2, rs.restP2);
+                    CopyOrientDelta(stockRudder, rs.restR, rs.r2, rs.restR2, rs.restP2.pos,
+                        -1.0f, kRudder2AngleScale);
+                }
+            }
             };
 
         Events::vehicleRenderEvent += [](CVehicle* veh) {
@@ -1457,6 +1487,7 @@ public:
                 }
             }
             g_aileronStates.erase(veh);
+            g_rudderStates.erase(veh);
             g_hubStates.erase(veh);
             g_gearDoors.erase(veh);
             if (veh == g_abBound)
