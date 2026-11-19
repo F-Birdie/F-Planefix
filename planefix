@@ -1502,3 +1502,302 @@ public:
             };
     }
 } g_planeFeatures;
+// =====================================================================
+// Boat lights (namespaced so nothing collides with the plane code)
+// =====================================================================
+namespace BoatLights {
+
+    constexpr unsigned VEHICLE_PRERENDER = 0x6D6480;
+    constexpr unsigned VEHICLE_SETUP_RENDER = 0x6D64F0;
+    constexpr unsigned GET_LIGHTS_STATUS = 0x6D55C0;
+    constexpr unsigned HEAD_LIGHT_EFFECT = 0x6E0A50;
+    constexpr unsigned TAIL_LIGHT_EFFECT = 0x6E1780;
+    constexpr unsigned SETUP_LIGHT_FLAGS = 0x4C8C90;
+    constexpr unsigned LIT_SURFACE_PROPS = 0x8A645C;
+
+    using VehicleFn = void(__thiscall*)(CVehicle*);
+    using LightsStatusFn = bool(__thiscall*)(CVehicle*);
+    using HeadEffectFn = bool(__thiscall*)(CVehicle*, int, CMatrix*, bool, bool);
+    using TailEffectFn = bool(__thiscall*)(CVehicle*, int, CMatrix*, bool, bool, int, bool);
+    using SetupLightFlagsFn = void(__cdecl*)(CVehicle*);
+    static VehicleFn origVehiclePreRender = reinterpret_cast<VehicleFn>(VEHICLE_PRERENDER);
+    static VehicleFn origSetupRender = reinterpret_cast<VehicleFn>(VEHICLE_SETUP_RENDER);
+
+    static const char* kFrontName = "headlights";
+    static const char* kFront2Name = "headlights2";
+    static const char* kRearName = "taillights";
+    static const char* kRear2Name = "taillights2";
+    static const int kBoatModels[] = { 430, 446, 452, 453, 454, 472, 473, 484, 493, 595 };
+    constexpr int kTolerance = 1;
+
+#define VEH_OVERRIDE_LIGHTS(v) ((v)->m_nOverrideLights)
+
+    struct Pri0 {};
+    struct Pri1 : Pri0 {};
+    struct Pri2 : Pri1 {};
+
+    template <class T> auto EngineOnImpl(const T* v, Pri2) -> decltype(bool(v->bEngineOn)) { return v->bEngineOn; }
+    template <class T> auto EngineOnImpl(const T* v, Pri1) -> decltype(bool(v->vehicleFlags.bEngineOn)) { return v->vehicleFlags.bEngineOn; }
+    template <class T> bool EngineOnImpl(const T* v, Pri0) { return (*(reinterpret_cast<const uint8_t*>(v) + 0x428) & 0x10) != 0; }
+    static bool BoatEngineOn(const CVehicle* v) { return EngineOnImpl(v, Pri2{}); }
+
+    template <class T> auto BoatTypeImpl(const T* mi, Pri1) -> decltype(bool(mi->m_nVehicleType == 5)) { return mi->m_nVehicleType == 5; }
+    template <class T> bool BoatTypeImpl(const T*, Pri0) { return false; }
+
+    static bool IsBoat(CVehicle* v) {
+        for (int id : kBoatModels)
+            if (v->m_nModelIndex == id) return true;
+        auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(v->m_nModelIndex));
+        return mi && BoatTypeImpl(mi, Pri1{});
+    }
+
+    struct LightState { bool engine, status, lightsOn; int override; };
+    static LightState GetLightState(CVehicle* v) {
+        LightState s;
+        s.engine = BoatEngineOn(v);
+        s.status = reinterpret_cast<LightsStatusFn>(GET_LIGHTS_STATUS)(v);
+        s.override = VEH_OVERRIDE_LIGHTS(v);
+        s.lightsOn = false;
+        if (s.engine) {
+            s.lightsOn = s.status;
+            if (s.override == 1) s.lightsOn = false;
+            else if (s.override == 2) s.lightsOn = true;
+        }
+        return s;
+    }
+
+    struct LampBit { unsigned offset = 0; uint8_t mask = 0; };
+    static LampBit g_lamp[4];
+    static bool g_calibrated = false;
+
+    static void CalibrateLampBits() {
+        g_calibrated = true;
+        static uint8_t fake[0x800];
+        std::memset(fake, 0, sizeof(fake));
+        CVehicle* fakeVeh = reinterpret_cast<CVehicle*>(fake);
+        const auto Setup = reinterpret_cast<SetupLightFlagsFn>(SETUP_LIGHT_FLAGS);
+        for (unsigned off = 0x500; off < 0x600; off++) {
+            for (int b = 0; b < 8; b++) {
+                fake[off] = static_cast<uint8_t>(1u << b);
+                Setup(fakeVeh);
+                for (int i = 0; i < 4; i++)
+                    if (CVehicleModelInfo::ms_lightsOn[i] && g_lamp[i].offset == 0)
+                        g_lamp[i] = { off, static_cast<uint8_t>(1u << b) };
+            }
+            fake[off] = 0;
+        }
+    }
+
+    static void SetLamp(CVehicle* v, int lamp, bool on) {
+        const LampBit& lb = g_lamp[lamp];
+        if (lb.offset == 0) return;
+        uint8_t* p = reinterpret_cast<uint8_t*>(v) + lb.offset;
+        *p = on ? static_cast<uint8_t>(*p | lb.mask) : static_cast<uint8_t>(*p & ~lb.mask);
+    }
+    static void SetAllLamps(CVehicle* v, bool on) {
+        for (int i = 0; i < 4; i++) SetLamp(v, i, on);
+    }
+
+    struct FindCtx { const char* name; RwFrame* found; };
+    static RwFrame* FindFrameCB(RwFrame* frame, void* data) {
+        auto* ctx = static_cast<FindCtx*>(data);
+        const char* n = GetFrameNodeName(frame);
+        if (n && _stricmp(n, ctx->name) == 0) { ctx->found = frame; return nullptr; }
+        RwFrameForAllChildren(frame, FindFrameCB, ctx);
+        return ctx->found ? nullptr : frame;
+    }
+
+    static CVector LocalPos(RpClump* clump, RwFrame* frame) {
+        RwFrame* root = RpClumpGetFrame(clump);
+        RwV3d p = RwFrameGetMatrix(frame)->pos;
+        for (RwFrame* f = RwFrameGetParent(frame); f && f != root; f = RwFrameGetParent(f))
+            RwV3dTransformPoints(&p, &p, 1, RwFrameGetMatrix(f));
+        return CVector(p.x, p.y, p.z);
+    }
+
+    struct BoatLightDummies { RpClump* clump = nullptr; bool any = false; CVector pos[4]; };
+    static std::unordered_map<CVehicle*, BoatLightDummies> g_boats;
+
+    static BoatLightDummies* GetBoatLights(CVehicle* v) {
+        RpClump* clump = v->m_pRwClump;
+        if (!clump) return nullptr;
+        BoatLightDummies& bl = g_boats[v];
+        if (bl.clump != clump) {
+            bl.clump = clump; bl.any = false;
+            const char* names[4] = { kFrontName, kRearName, kFront2Name, kRear2Name };
+            for (int i = 0; i < 4; i++) {
+                bl.pos[i] = CVector(0, 0, 0);
+                FindCtx ctx = { names[i], nullptr };
+                RwFrameForAllChildren(RpClumpGetFrame(clump), FindFrameCB, &ctx);
+                if (ctx.found) { bl.pos[i] = LocalPos(clump, ctx.found); if (i < 2) bl.any = true; }
+            }
+        }
+        return bl.any ? &bl : nullptr;
+    }
+
+    struct Marker { uint8_t r, g, b; };
+    static const Marker kMarkers[4] = { {255,175,0}, {0,255,200}, {185,255,0}, {255,60,0} };
+
+    struct LampMat {
+        RpMaterial* mat = nullptr;
+        RwTexture* original = nullptr;
+        int lamp = 0;
+        RwRGBA origColor = {};
+        RwSurfaceProperties origSurface = {};
+        RwTexture* lit = nullptr;
+        bool litResolved = false;
+    };
+    struct ModelCache { RpClump* templ = nullptr; std::vector<LampMat> mats; };
+    static std::unordered_map<int, ModelCache> g_cache;
+
+    static RpMaterial* CollectMaterial(RpMaterial* m, void* data) {
+        auto* out = static_cast<std::vector<LampMat>*>(data);
+        RwTexture* tex = RpMaterialGetTexture(m);
+        if (!tex) return m;
+        if (_strnicmp(RwTextureGetName(tex), "vehiclelights", 13) != 0) return m;
+        const RwRGBA* col = RpMaterialGetColor(m);
+        int lamp = -1;
+        for (int i = 0; i < 4; i++) {
+            if (std::abs((int)col->red - kMarkers[i].r) <= kTolerance &&
+                std::abs((int)col->green - kMarkers[i].g) <= kTolerance &&
+                std::abs((int)col->blue - kMarkers[i].b) <= kTolerance) {
+                lamp = i; break;
+            }
+        }
+        if (lamp < 0) return m;
+        LampMat l;
+        l.mat = m; l.original = tex; l.lamp = lamp;
+        l.origColor = *col; l.origSurface = *RpMaterialGetSurfaceProperties(m);
+        out->push_back(l);
+        return m;
+    }
+
+    static RpAtomic* CollectAtomic(RpAtomic* a, void* data) {
+        if (RpGeometry* g = RpAtomicGetGeometry(a))
+            RpGeometryForAllMaterials(g, CollectMaterial, data);
+        return a;
+    }
+
+    static RwTexture* FindLitTexture(RwTexture* original) {
+        if (!original) return CVehicleModelInfo::ms_pLightsOnTexture;
+        const char* name = RwTextureGetName(original);
+        if (!name) return CVehicleModelInfo::ms_pLightsOnTexture;
+        size_t len = strlen(name);
+        if (len > 3 && _stricmp(name + len - 3, "128") == 0)
+            return CVehicleModelInfo::ms_pLightsOnTexture;
+        char litName[64];
+        snprintf(litName, sizeof(litName), "%s_on", name);
+        if (RwTexDictionary* dict = RwTextureGetDictionary(original))
+            if (RwTexture* t = RwTexDictionaryFindNamedTexture(dict, litName)) return t;
+        if (RwTexDictionary* dict = CVehicleModelInfo::ms_pVehicleTxd)
+            if (RwTexture* t = RwTexDictionaryFindNamedTexture(dict, litName)) return t;
+        return CVehicleModelInfo::ms_pLightsOnTexture;
+    }
+
+    static void UpdateLampTextures(CVehicle* self) {
+        CBaseModelInfo* mi = CModelInfo::GetModelInfo(self->m_nModelIndex);
+        if (!mi || !mi->m_pRwObject) return;
+        ModelCache& c = g_cache[self->m_nModelIndex];
+        RpClump* templ = reinterpret_cast<RpClump*>(mi->m_pRwObject);
+        if (c.templ != templ) {
+            c.templ = templ; c.mats.clear();
+            RpClumpForAllAtomics(templ, CollectAtomic, &c.mats);
+        }
+        if (c.mats.empty() || !CVehicleModelInfo::ms_pLightsTexture) return;
+        reinterpret_cast<SetupLightFlagsFn>(SETUP_LIGHT_FLAGS)(self);
+        const RwSurfaceProperties* litSurface = reinterpret_cast<const RwSurfaceProperties*>(LIT_SURFACE_PROPS);
+        for (LampMat& l : c.mats) {
+            const bool on = CVehicleModelInfo::ms_lightsOn[l.lamp] != 0;
+            if (on) {
+                if (!l.litResolved) { l.lit = FindLitTexture(l.original); l.litResolved = true; }
+                if (l.lit && RpMaterialGetTexture(l.mat) != l.lit)
+                    RpMaterialSetTexture(l.mat, l.lit);
+                const RwRGBA white = { 255, 255, 255, l.origColor.alpha };
+                RpMaterialSetColor(l.mat, &white);
+                RpMaterialSetSurfaceProperties(l.mat, litSurface);
+            }
+            else {
+                if (RpMaterialGetTexture(l.mat) != l.original)
+                    RpMaterialSetTexture(l.mat, l.original);
+                RpMaterialSetColor(l.mat, &l.origColor);
+                RpMaterialSetSurfaceProperties(l.mat, &l.origSurface);
+            }
+        }
+    }
+
+    static void ForgetModel(int modelIndex) {
+        auto it = g_cache.find(modelIndex);
+        if (it == g_cache.end()) return;
+        CBaseModelInfo* mi = CModelInfo::GetModelInfo(modelIndex);
+        const bool stillSame = mi && mi->m_pRwObject && reinterpret_cast<RpClump*>(mi->m_pRwObject) == it->second.templ;
+        if (stillSame) {
+            for (LampMat& l : it->second.mats) {
+                if (RpMaterialGetTexture(l.mat) != l.original) RpMaterialSetTexture(l.mat, l.original);
+                RpMaterialSetColor(l.mat, &l.origColor);
+                RpMaterialSetSurfaceProperties(l.mat, &l.origSurface);
+            }
+        }
+        g_cache.erase(it);
+    }
+
+    static void DrawCoronas(CVehicle* v, const BoatLightDummies& bl) {
+        auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(v->m_nModelIndex));
+        if (!mi || !mi->m_pVehicleStruct || !v->m_matrix) return;
+        CVector* dummies = mi->m_pVehicleStruct->m_avDummyPos;
+        const CVector saved[4] = { dummies[0], dummies[1], dummies[2], dummies[3] };
+        for (int i = 0; i < 4; i++) dummies[i] = bl.pos[i];
+        CMatrix* mat = reinterpret_cast<CMatrix*>(v->m_matrix);
+        const auto Head = reinterpret_cast<HeadEffectFn>(HEAD_LIGHT_EFFECT);
+        const auto Tail = reinterpret_cast<TailEffectFn>(TAIL_LIGHT_EFFECT);
+        for (int side = 0; side < 2; side++) {
+            const bool isRight = side == 0;
+            Head(v, 0, mat, isRight, false);
+            Tail(v, 0, mat, isRight, false, 0, true);
+            Tail(v, 1, mat, isRight, false, 0, true);
+        }
+        for (int i = 0; i < 4; i++) dummies[i] = saved[i];
+    }
+
+    static void __fastcall VehiclePreRenderHook(CVehicle* self, void*) {
+        origVehiclePreRender(self);
+        if (!IsBoat(self)) return;
+        const LightState ls = GetLightState(self);
+        if (!ls.lightsOn) return;
+        if (BoatLightDummies* bl = GetBoatLights(self))
+            DrawCoronas(self, *bl);
+    }
+
+    static void __fastcall SetupRenderHook(CVehicle* self, void*) {
+        if (IsBoat(self)) {
+            if (!g_calibrated) CalibrateLampBits();
+            const LightState ls = GetLightState(self);
+            SetAllLamps(self, ls.lightsOn);
+            UpdateLampTextures(self);
+        }
+        origSetupRender(self);
+    }
+
+    static void RedirectCalls(unsigned target, void* hook) {
+        for (unsigned a = 0x401000; a < 0x857000 - 5; ++a) {
+            if (*reinterpret_cast<const uint8_t*>(a) != 0xE8) continue;
+            const int32_t rel = *reinterpret_cast<const int32_t*>(a + 1);
+            if (a + 5 + rel == target)
+                patch::RedirectCall(a, hook);
+        }
+    }
+
+    class BoatLightsMod {
+    public:
+        BoatLightsMod() {
+            RedirectCalls(VEHICLE_PRERENDER, reinterpret_cast<void*>(&VehiclePreRenderHook));
+            RedirectCalls(VEHICLE_SETUP_RENDER, reinterpret_cast<void*>(&SetupRenderHook));
+            Events::vehicleDtorEvent += [](CVehicle* veh) {
+                g_boats.erase(veh);
+                if (IsBoat(veh))
+                    ForgetModel(veh->m_nModelIndex);
+                };
+        }
+    };
+    static BoatLightsMod g_boatLightsMod;
+
+} // namespace BoatLights
