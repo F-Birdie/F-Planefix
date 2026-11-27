@@ -3,7 +3,7 @@
 // - Extra ailerons (aileron_l2 / aileron_r2 hinged on aileron2_pos)
 // - Second rudder (rudder2 hinged on rudder2_pos, scale 3.0, inverted)
 // - Alpha-test ref fix for planes / helis / trains / boats
-// - Custom exhaust (startup puff + heat haze, optional double)
+// - Custom exhaust (startup puff + heat haze, optional double) - planes and helis
 // - Bonnet / boot openings
 // - Ground rolling wheels + stationary hubs
 // - Landing gear doors
@@ -12,6 +12,8 @@
 // - Hydra missiles (pairs for unguided, 1/6/2/5/3/4 for homing)
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath> 
 #include <unordered_map>
@@ -28,6 +30,7 @@
 #include "CTimer.h"
 #include "CPad.h"
 #include "CProjectileInfo.h"
+#include "CPools.h"
 #include "FxManager_c.h"
 #include "FxSystem_c.h"
 #include "RenderWare.h"
@@ -161,7 +164,7 @@ static void UpdateLampTextures(CPlane* self) {
         if (templ)
             RpClumpForAllAtomics(templ, CollectAtomic, &c.mats);
     }
-    if (c.mats.empty() || !CVehicleModelInfo::ms_pLightsTexture || !CVehicleModelInfo::ms_lightsOn)
+    if (c.mats.empty() || !CVehicleModelInfo::ms_pLightsTexture)
         return;
 
     reinterpret_cast<SetupLightFlagsFn>(SETUP_LIGHT_FLAGS)(self);
@@ -217,6 +220,7 @@ struct RestMat {
     RwV3d right{}, up{}, at{}, pos{};
 };
 struct ExtraAileronState {
+    RpClump* clump = nullptr;
     bool searched = false;
     RwFrame* l2 = nullptr;
     RwFrame* r2 = nullptr;
@@ -224,6 +228,7 @@ struct ExtraAileronState {
     RestMat restL, restR, restL2, restR2, restP2;
 };
 struct ExtraRudderState {
+    RpClump* clump = nullptr;
     bool searched = false;
     RwFrame* r2 = nullptr;
     RwFrame* p2 = nullptr;
@@ -327,7 +332,7 @@ static bool ShouldFixAlphaRef(CVehicle* veh) {
 }
 
 // =====================================================================
-// 4) Custom exhaust
+// 4) Custom exhaust (planes via PreRender, helis via render event)
 // =====================================================================
 constexpr int      kExhaustDummyIndex = 6;
 constexpr float    kHazeIntensity = 0.1f;
@@ -360,7 +365,7 @@ struct ExhaustState {
     FxSystem_c* haze[2] = {};
     FxSystem_c* puff[2] = {};
     RwMatrix* puffMat[2] = {};
-    DWORD       puffEnd = 0;
+    unsigned    puffEnd = 0;
 };
 static std::unordered_map<CVehicle*, ExhaustState> g_exhaustStates;
 
@@ -372,20 +377,18 @@ static void Kill(FxSystem_c*& fx) {
 }
 
 static RwMatrix* NextPuffMatrix() {
-    static RwMatrix* pool[16] = {};
+    alignas(16) static RwMatrix pool[32];
     static int next = 0;
-    RwMatrix*& m = pool[next];
-    next = (next + 1) % 16;
-    if (!m)
-        m = RwMatrixCreate();
+    RwMatrix* m = &pool[next];
+    next = (next + 1) % 32;
     return m;
 }
 
-static RwMatrix* RootMatrix(CPlane* veh) {
+static RwMatrix* RootMatrix(CVehicle* veh) {
     return RwFrameGetMatrix(RpClumpGetFrame(veh->m_pRwClump));
 }
 
-static void UpdatePuffMatrix(CPlane* veh, RwMatrix* out, const RwV3d& dummy) {
+static void UpdatePuffMatrix(CVehicle* veh, RwMatrix* out, const RwV3d& dummy) {
     RwMatrix* root = RootMatrix(veh);
     RwV3d world;
     RwV3dTransformPoints(&world, &dummy, 1, root);
@@ -401,7 +404,7 @@ static void UpdatePuffMatrix(CPlane* veh, RwMatrix* out, const RwV3d& dummy) {
     RwMatrixUpdate(out);
 }
 
-static FxSystem_c* CreateHaze(CPlane* veh, const RwV3d& dummy) {
+static FxSystem_c* CreateHaze(CVehicle* veh, const RwV3d& dummy) {
     RwV3d pos = dummy;
     FxSystem_c* fx = g_fxMan.CreateFxSystem(const_cast<char*>("nitro"), &pos, RootMatrix(veh), true);
     if (!fx)
@@ -415,7 +418,7 @@ static FxSystem_c* CreateHaze(CPlane* veh, const RwV3d& dummy) {
     return fx;
 }
 
-static void StartPuff(CPlane* veh, ExhaustState& s, int i, const RwV3d& dummy) {
+static void StartPuff(CVehicle* veh, ExhaustState& s, int i, const RwV3d& dummy) {
     Kill(s.puff[i]);
     s.puffMat[i] = NextPuffMatrix();
     UpdatePuffMatrix(veh, s.puffMat[i], dummy);
@@ -427,7 +430,7 @@ static void StartPuff(CPlane* veh, ExhaustState& s, int i, const RwV3d& dummy) {
     s.puff[i]->Play();
 }
 
-static void UpdateExhaust(CPlane* veh) {
+static void UpdateExhaust(CVehicle* veh) {
     if (!veh->m_pRwClump)
         return;
     auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(veh->m_nModelIndex));
@@ -449,7 +452,7 @@ static void UpdateExhaust(CPlane* veh) {
     if (on && !s.engineWasOn) {
         for (int i = 0; i < count; i++)
             StartPuff(veh, s, i, dummies[i]);
-        s.puffEnd = GetTickCount() + kPuffMs;
+        s.puffEnd = CTimer::m_snTimeInMilliseconds + kPuffMs;
     }
     s.engineWasOn = on;
 
@@ -465,7 +468,7 @@ static void UpdateExhaust(CPlane* veh) {
         }
 
         if (s.puff[i]) {
-            if (GetTickCount() >= s.puffEnd) {
+            if (static_cast<int>(CTimer::m_snTimeInMilliseconds - s.puffEnd) >= 0) {
                 Kill(s.puff[i]);
             }
             else {
@@ -485,6 +488,34 @@ static void OnVehicleDestroyed(CVehicle* veh) {
         Kill(it->second.puff[i]);
     }
     g_exhaustStates.erase(it);
+}
+
+// Helis: the render event does not fire for them, so they are driven from the script
+// loop by walking the vehicle pool (same workaround as the slide-door plugin).
+static bool IsHeliVehicle(CVehicle* v) {
+    if (!v)
+        return false;
+    if (v->m_nVehicleClass == VEHICLE_HELI)
+        return true;
+    switch (v->m_nModelIndex) {
+    case 417: case 425: case 447: case 469:
+    case 487: case 488: case 497: case 548: case 563:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void UpdateAllHeliExhausts() {
+    auto* pool = CPools::ms_pVehiclePool;
+    if (!pool)
+        return;
+    for (int i = 0; i < pool->m_nSize; ++i) {
+        CVehicle* v = pool->GetAt(i);
+        if (!v || !v->m_pRwClump || !IsHeliVehicle(v))
+            continue;
+        UpdateExhaust(v);
+    }
 }
 
 // =====================================================================
@@ -517,6 +548,7 @@ static void __fastcall OpenDoorHook(CPlane* self, void*, CPed* ped, int componen
 // 6) Rolling wheels + hubs
 // =====================================================================
 struct HubState {
+    RpClump* clump = nullptr;
     bool searched = false;
     RwFrame* hub[4] = {};
     RwFrame* wheel[4] = {};
@@ -547,6 +579,10 @@ static void UpdateHubs(CPlane* self) {
     if (!self->m_pRwClump)
         return;
     HubState& st = g_hubStates[self];
+    if (st.clump != self->m_pRwClump) {
+        st = HubState();
+        st.clump = self->m_pRwClump;
+    }
     if (!st.searched) {
         st.searched = true;
         RwFrame* root = RpClumpGetFrame(self->m_pRwClump);
@@ -740,8 +776,33 @@ static void UpdateGearDoors(CPlane* veh) {
 // =====================================================================
 // 8) Hydra thrusters
 // =====================================================================
-static bool GetNamedPos(RwFrame* root, const char* name, CVector& out) {
-    RwFrame* f = FindFrameByName(root, name);
+
+// Per-vehicle cache of the Hydra frames, rebuilt only when the clump changes.
+struct HydraFrames {
+    RpClump* clump = nullptr;
+    RwFrame* pivotF = nullptr;
+    RwFrame* pivotR = nullptr;
+    RwFrame* thrF = nullptr;
+    RwFrame* thrR = nullptr;
+    RwFrame* ab = nullptr;
+};
+static std::unordered_map<CVehicle*, HydraFrames> g_hydraFrames;
+
+static HydraFrames& GetHydraFrames(CVehicle* veh) {
+    HydraFrames& h = g_hydraFrames[veh];
+    if (h.clump != veh->m_pRwClump) {
+        h.clump = veh->m_pRwClump;
+        RwFrame* root = RpClumpGetFrame(h.clump);
+        h.pivotF = FindFrameByName(root, "wheel_lm_dummy");
+        h.pivotR = FindFrameByName(root, "wheel_rm_dummy");
+        h.thrF = FindFrameByName(root, "thruster_f");
+        h.thrR = FindFrameByName(root, "thruster_r");
+        h.ab = FindFrameByName(root, "afterburner");
+    }
+    return h;
+}
+
+static bool FramePos(RwFrame* f, CVector& out) {
     if (!f)
         return false;
     RwMatrix* m = RwFrameGetMatrix(f);
@@ -759,18 +820,11 @@ static void UpdateHydraThrusters(CVehicle* veh) {
     if (!veh || veh->m_nModelIndex != MODEL_HYDRA || !veh->m_pRwClump)
         return;
     auto* plane = static_cast<CPlane*>(veh);
-    RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
-    if (!root)
-        return;
 
+    HydraFrames& h = GetHydraFrames(veh);
     CVector pivotF, pivotR, thrF, thrR;
-    if (!GetNamedPos(root, "wheel_lm_dummy", pivotF))
-        return;
-    if (!GetNamedPos(root, "wheel_rm_dummy", pivotR))
-        return;
-    if (!GetNamedPos(root, "thruster_f", thrF))
-        return;
-    if (!GetNamedPos(root, "thruster_r", thrR))
+    if (!FramePos(h.pivotF, pivotF) || !FramePos(h.pivotR, pivotR) ||
+        !FramePos(h.thrF, thrF) || !FramePos(h.thrR, thrR))
         return;
 
     const CVector dF = { thrF.x - pivotF.x, thrF.y - pivotF.y, thrF.z - pivotF.z };
@@ -817,17 +871,7 @@ static RwMatrix g_jtParent;
 static bool GetAfterburnerLocalPos(CVehicle* veh, CVector& out) {
     if (!veh || !veh->m_pRwClump)
         return false;
-    RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
-    if (!root)
-        return false;
-    RwFrame* ab = FindFrameByName(root, "afterburner");
-    if (!ab)
-        return false;
-    RwMatrix* m = RwFrameGetMatrix(ab);
-    if (!m)
-        return false;
-    out = { m->pos.x, m->pos.y, m->pos.z };
-    return true;
+    return FramePos(GetHydraFrames(veh).ab, out);
 }
 
 static void KillAbExtras() {
@@ -1374,7 +1418,8 @@ static void __fastcall CombinedPreRenderHook(CPlane* self, void*) {
         origPreRender(self);
     if (self && self->m_pRwObject)
         UpdateHubs(self);
-    UpdateExhaust(self);
+    if (self)
+        UpdateExhaust(self);
     if (self && self->m_pRwObject)
         DoPlaneLightsSafe(self);
     if (self)
@@ -1410,6 +1455,10 @@ public:
             RwFrame* ar = plane->m_aCarNodes[PLANE_AILERON_R];
             if (al && ar && root) {
                 ExtraAileronState& st = g_aileronStates[veh];
+                if (st.clump != veh->m_pRwClump) {
+                    st = ExtraAileronState();
+                    st.clump = veh->m_pRwClump;
+                }
                 if (!st.searched) {
                     st.searched = true;
                     st.l2 = FindFrameByName(root, "aileron_l2");
@@ -1433,6 +1482,10 @@ public:
             RwFrame* stockRudder = plane->m_aCarNodes[PLANE_RUDDER_NODE];
             if (stockRudder && root) {
                 ExtraRudderState& rs = g_rudderStates[veh];
+                if (rs.clump != veh->m_pRwClump) {
+                    rs = ExtraRudderState();
+                    rs.clump = veh->m_pRwClump;
+                }
                 if (!rs.searched) {
                     rs.searched = true;
                     rs.r2 = FindFrameByName(root, "rudder2");
@@ -1460,6 +1513,11 @@ public:
                 RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTIONREF, reinterpret_cast<void*>(kCarRef));
             };
 
+        // Helicopter exhaust (planes keep using the PreRender path above)
+        Events::processScriptsEvent += [] {
+            UpdateAllHeliExhausts();
+            };
+
         Events::vehicleRenderEvent += [](CVehicle* veh) {
             UpdateHydraThrusters(veh);
             };
@@ -1471,7 +1529,7 @@ public:
         Events::gameProcessEvent += [] {
             const float dt = CTimer::ms_fTimeStep / 50.0f;
             for (auto& entry : g_missileStates) {
-                if (entry.second.ok)
+                if (entry.second.ok && entry.first->m_pRwClump == entry.second.clump)
                     UpdateMissileState(entry.first, entry.second, dt);
             }
             };
@@ -1490,6 +1548,7 @@ public:
             g_rudderStates.erase(veh);
             g_hubStates.erase(veh);
             g_gearDoors.erase(veh);
+            g_hydraFrames.erase(veh);
             if (veh == g_abBound)
                 KillAfterburner();
             OnVehicleDestroyed(veh);
